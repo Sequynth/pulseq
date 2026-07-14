@@ -9,7 +9,8 @@ Ndummy=20;                      % number of dummy scans
 delta= pi / Nr;                 % angular increment; try golden angle pi*(3-5^0.5) or 0.5 of it
 
 % more in-depth parameters
-rfSpoilingInc=117;              % RF spoiling increment
+% RF spoiling increment = 84° for smoother transient decay, https://doi.org/10.1002/mrm.1910350216, 169° for diffusion independent rf spoiling in steady-state https://doi.org/10.1371/journal.pone.0324455
+rfSpoilingInc=84;              % RF spoiling increment
 
 % set system limits
 sys = mr.opts('MaxGrad', 28, 'GradUnit', 'mT/m', ...
@@ -18,7 +19,8 @@ sys = mr.opts('MaxGrad', 28, 'GradUnit', 'mT/m', ...
 
 % Create alpha-degree slice selection pulse and gradient
 [rf, gz] = mr.makeSincPulse(alpha*pi/180,'Duration',4e-3,...
-    'SliceThickness',sliceThickness,'apodization',0.5,'timeBwProduct',4,'system',sys);
+    'SliceThickness',sliceThickness,'apodization',0.5,'timeBwProduct',4,'system',sys,...
+    'use','excitation');
 
 % Define other gradients and ADC events
 deltak=1/fov;

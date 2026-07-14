@@ -19,10 +19,11 @@ This project is open source under the MIT License. See [LICENSE](LICENSE) for de
 
 The directories are organized as follows:
 
-* `doc/` - Contains the file specification and HTML source code documentation
-* `examples/` - Contains example sequence files (`*.seq`)
-* `src/` - C++ class for reading sequence files
-* `matlab/` - MATLAB code for reading, writing, modifying and visualizing sequence files
+* [`doc/`](https://github.com/pulseq/pulseq/tree/master/doc) - Contains the file specification and HTML source code documentation
+* [`tests/legacy/approved/`](https://github.com/pulseq/pulseq/tree/master/tests/legacy/approved)
+  - Contains example files in the Pulseq format (`*.seq`)
+* [`src/`](https://github.com/pulseq/pulseq/tree/master/src) - C++ class for reading sequence files
+* [`matlab/`](https://github.com/pulseq/pulseq/tree/master/matlab) - MATLAB code for reading, writing, modifying and visualizing sequence files
 
 ## System requirements
 
@@ -30,8 +31,7 @@ System requirements vary depending on which features one intends to use or modif
 
 - doxygen is required to generate HTML source code documentation
 - latex is required to build the file specification PDF
-- python is required to run the build tests and to generate advanced RF pulses
-- python's sigpy package is required to generate advanced RF pulses
+- python is required to run the build tests
 
 These are optional and not essential to start using Pulseq.
 

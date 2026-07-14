@@ -13,7 +13,8 @@ TI = 1.1 ;
 TRout = 2.5 ;
 % TE & TR in the inner loop are as short as possible derived from the above parameters and the system specs
 % more in-depth parameters
-rfSpoilingInc = 117 ;              % RF spoiling increment
+% RF spoiling increment = 84° for smoother transient decay, https://doi.org/10.1002/mrm.1910350216, 169° for diffusion independent rf spoiling in steady-state https://doi.org/10.1371/journal.pone.0324455
+rfSpoilingInc = 84 ;              % RF spoiling increment
 rfLen = 100e-6 ;
 ax = struct ; % encoding axes
 % sagittal fov options % remember to enable OrientationMapping SAG in setDefinition section below
@@ -34,11 +35,18 @@ ax.n1 = strfind('xyz', ax.d1) ;
 ax.n2 = strfind('xyz', ax.d2) ;
 ax.n3 = strfind('xyz', ax.d3) ;
 
+%% check dependencies
+if ~mr.aux.isSigPyAvailable()
+    warning('This sequence relies on python and sigpy to generate RF pulses, the script will stop now before failing');
+    return;
+end
+
 %%
 
 % Create alpha-degree hard pulse and gradient
-rf = mr.makeBlockPulse(alpha*pi/180, sys, 'Duration', rfLen) ;
-rf180 = mr.makeAdiabaticPulse('hypsec', sys, 'Duration', 10.24e-3, 'dwell', 1e-5) ;
+rf = mr.makeBlockPulse(alpha*pi/180, sys, 'Duration', rfLen,  'use', 'excitation') ;
+rf180 = mr.makeAdiabaticPulse('hypsec', sys, 'Duration', 10.24e-3, 'dwell', 1e-5,...
+    'use', 'inversion') ;
 
 % Define other gradients and ADC events
 deltak = 1./fov ;
@@ -89,9 +97,6 @@ lblResetRefScan = mr.makeLabel('SET','REF', false) ;
 lblResetRefAndImaScan = mr.makeLabel('SET','IMA', false) ;
 
 % pre-register objects that do not change while looping
-gslSp.id=seq.registerGradEvent(gslSp);
-groSp.id=seq.registerGradEvent(groSp);
-gro1.id=seq.registerGradEvent(gro1);
 [~, rf.shapeIDs]=seq.registerRfEvent(rf); % the phase of the RF object will change, therefore we only pre-register the shapes 
 [rf180.id, rf180.shapeIDs]=seq.registerRfEvent(rf180); % 
 
@@ -137,6 +142,11 @@ gro1 = mr.scaleGrad(gro1, -1) ;
 % reverse the polarity of all gradients in partition encoding direction (Gx)
 gpe1.amplitude = -gpe1.amplitude ;
 gslSp.amplitude = -gslSp.amplitude ;
+
+groSp.id=seq.registerGradEvent(groSp);
+gro1.id=seq.registerGradEvent(gro1);
+gslSp.id=seq.registerGradEvent(gslSp);
+
 % start the sequence
 tic;
 
@@ -219,7 +229,7 @@ seq.setDefinition('ReadoutOversamplingFactor', ro_os) ;
 seq.setDefinition('OrientationMapping', 'SAG') ; % only when programming in saggital orientation
 seq.setDefinition('kSpaceCenterLine', centerLineIdx-1) ;
 seq.setDefinition('PhaseResolution', phaseResoluion) ;
-seq.write('mprage_gt.seq') ;      % Write to pulseq file
+seq.write('mprage_grappa.seq') ;      % Write to pulseq file
 %seq.install('siemens');
 
 return;

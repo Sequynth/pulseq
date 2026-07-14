@@ -1,4 +1,7 @@
 #include "ExternalSequence.h"
+extern "C" {
+	#include "md5.h"
+}
 
 #include <stdio.h>		// sscanf
 #include <cstring>		// strlen etc
@@ -6,16 +9,85 @@
 
 #include <algorithm>	// for std::max_element
 #include <functional>	// for std::bind...
+#include <stdint.h>
 
 #include <math.h>		// fabs etc
 
 #include <assert.h>		// assert (TODO: remove in the released version)
 
+// optionally use SEQ_NAMESPACE
+#ifdef SEQ_NAMESPACE
+using namespace SEQ_NAMESPACE;
+#endif
+
 ExternalSequence::PrintFunPtr ExternalSequence::print_fun = &ExternalSequence::defaultPrint;
 const int ExternalSequence::MAX_LINE_SIZE = 256;
 const char ExternalSequence::COMMENT_CHAR = '#';
 std::string& str_trim(std::string& str);
+std::string str_tolower(std::string str);
+
+namespace {
+
+template <typename T>
+bool readScalar(std::istream& stream, T& value)
+{
+	stream.read(reinterpret_cast<char*>(&value), sizeof(T));
+	return stream.good();
+}
+
+template <typename T>
+bool readArray(std::istream& stream, std::vector<T>& data, size_t count)
+{
+	data.resize(count);
+	if (count==0)
+		return true;
+	stream.read(reinterpret_cast<char*>(&data[0]), sizeof(T)*count);
+	return stream.good();
+}
+
+int64_t pulseqBinaryMagic()
+{
+	unsigned char bytes[8] = {1, 'p', 'u', 'l', 's', 'e', 'q', 2};
+	int64_t v = 0;
+	memcpy(&v, bytes, 8);
+	return v;
+}
+
+bool streamHasPulseqBinaryMagic(std::istream& stream)
+{
+	std::istream::pos_type pos = stream.tellg();
+	if (pos<0)
+		return false;
+	int64_t magic = 0;
+	if (!readScalar(stream, magic)) {
+		stream.clear();
+		stream.seekg(pos, std::ios::beg);
+		return false;
+	}
+	stream.clear();
+	stream.seekg(pos, std::ios::beg);
+	return magic == pulseqBinaryMagic();
+}
+
+long ps_to_us_rounded(int64_t ps)
+{
+	if (ps>=0)
+		return static_cast<long>((ps + 500000LL) / 1000000LL);
+	return static_cast<long>((ps - 500000LL) / 1000000LL);
+}
+
+int ps_to_ns_rounded(int64_t ps)
+{
+	if (ps>=0)
+		return static_cast<int>((ps + 500LL) / 1000LL);
+	return static_cast<int>((ps - 500LL) / 1000LL);
+}
+
+}
+
+// TODO: get rid of this Siemens-specific initialization and make it more vendor-neutral
 double SeqBlock::s_blockDurationRaster = 10.0;
+double SeqBlock::s_gradientRaster = 10.0;
 
 /***********************************************************/
 ExternalSequence::ExternalSequence()
@@ -25,7 +97,10 @@ ExternalSequence::ExternalSequence()
 	version_minor=0;
 	version_revision=0;
 	version_combined=0;
+	bIsBinary = false;
 	m_bSignatureDefined=false;
+	m_bSignatureCheckSucceeded=false;
+    m_ArbGradSamplingMode=ags_center;
 }
 
 /***********************************************************/
@@ -34,15 +109,15 @@ ExternalSequence::~ExternalSequence(){}
 /***********************************************************/
 void ExternalSequence::print_msg(MessageType level, std::ostream& ss) {
 	if (MSG_LEVEL>=level) {
-#if defined(VXWORKS) || defined (BUILD_PLATFORM_LINUX)
-		// we skip messages on the scanner platforms due to performance limitations
-		// we could trivially use UTRACE on newer scanners, but it is not compatible with older platforms
-#else		
+//#if defined(VXWORKS) || defined (BUILD_PLATFORM_LINUX)
+//		// we skip messages on the scanner platforms due to performance limitations
+//		// we could trivially use UTRACE on newer scanners, but it is not compatible with older platforms
+//#else		
 		std::ostringstream oss;
 		oss.width(2*(level-1)); oss << "";
 		oss << static_cast<std::ostringstream&>(ss).str();
 		print_fun(oss.str().c_str());
-#endif
+//#endif
 	}
 }
 
@@ -56,6 +131,11 @@ void ExternalSequence::reset()
 	m_blockDurations_ru.clear();
 	m_blocks.clear();
 	m_bSignatureDefined=false;
+	// not on vb17 // m_strSignature.clear();
+	m_strSignature="";
+	m_bSignatureCheckSucceeded=false;
+	// not on vb17 // m_strCalculatedMD5Signature.clear();
+	m_strCalculatedMD5Signature="";
 	m_definitions.clear();
 	m_definitions_str.clear();
 	m_extensionLibrary.clear();
@@ -90,81 +170,677 @@ bool ExternalSequence::load(std::string path)
 	std::ifstream data_file;
 	bool isSingleFileMode = true;
 	std::string filepath = path;
-	if (filepath.substr(filepath.size()-4) != std::string(".seq")) {
-		filepath = path + PATH_SEPARATOR + "external.seq";
-	}
+	print_msg(NORMAL_MSG, std::ostringstream().flush() << "Opening " << filepath);			
 	// Open in binary mode to ensure all end-of-line characters are processed
 	data_file.open(filepath.c_str(), std::ios::in | std::ios::binary);
 	data_file.seekg(0, std::ios::beg);
 
-	if (!data_file.good())
+	if (data_file.is_open() && data_file.good())
 	{
-		// Try separate file mode (blocks.seq, events.seq, shapes.seq)
-		// not really logical, but the current code expects [VERSION] to be defined in every file, 
-		// [DEFINITIONS] to be in the blocks.seq and only blocks.seq is signed... Not logical at all... TODO: FixMe!
-
-		reset();
-
-		filepath = path + PATH_SEPARATOR + "shapes.seq";
-		data_file.open(filepath.c_str(), std::ios::in | std::ios::binary);
 		data_file.seekg(0, std::ios::beg);
-		
-		if (!data_file.good())
+		if (streamHasPulseqBinaryMagic(data_file))
+			return loadBinary(data_file);
+		return load(data_file);
+	}
+
+	// Try separate file mode (blocks.seq, events.seq, shapes.seq)
+	// not really logical, but the current code expects [VERSION] to be defined in every file,
+	// [DEFINITIONS] to be in the blocks.seq and only blocks.seq is signed... Not logical at all... TODO: FixMe!
+	reset();
+
+	filepath = path + PATH_SEPARATOR + "shapes.seq";
+	data_file.clear();
+	data_file.close();
+	data_file.open(filepath.c_str(), std::ios::in | std::ios::binary);
+	data_file.seekg(0, std::ios::beg);
+	if (!data_file.is_open() || !data_file.good())
+	{
+		print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to read file " << filepath);
+		return false;
+	}
+	if (!load(data_file, lm_shapes)) {
+		print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to load shapes from file " << filepath);
+		return false;
+	}
+
+	filepath = path + PATH_SEPARATOR + "events.seq";
+	data_file.clear();
+	data_file.close();
+	data_file.open(filepath.c_str(), std::ios::in | std::ios::binary);
+	data_file.seekg(0, std::ios::beg);
+	if (!data_file.is_open() || !data_file.good())
+	{
+		print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to read file " << filepath);
+		return false;
+	}
+	if (!load(data_file, lm_events)) {
+		print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to load events from file " << filepath);
+		return false;
+	}
+
+	filepath = path + PATH_SEPARATOR + "blocks.seq";
+	data_file.clear();
+	data_file.close();
+	data_file.open(filepath.c_str(), std::ios::in | std::ios::binary);
+	data_file.seekg(0, std::ios::beg);
+	if (!data_file.is_open() || !data_file.good())
+	{
+		print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to read file " << filepath);
+		return false;
+	}
+
+	if (!load(data_file, lm_blocks)) {
+		print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to load blocks from file " << filepath);
+		return false;
+	}
+
+	return true;
+}
+
+bool ExternalSequence::loadBinary(std::istream& data_stream)
+{
+	reset();
+	bIsBinary = true;
+
+	if (!data_stream.good())
+	{
+		print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Function loadBinary() failed to read from the stream provided");
+		return false;
+	}
+
+	const int64_t prefix = static_cast<int64_t>(0xFFFFFFFFLL) << 32;
+	const int64_t section_definitions = prefix | static_cast<int64_t>(1);
+	const int64_t section_blocks      = prefix | static_cast<int64_t>(2);
+	const int64_t section_rf          = prefix | static_cast<int64_t>(3);
+	const int64_t section_gradients   = prefix | static_cast<int64_t>(4);
+	const int64_t section_trapezoids  = prefix | static_cast<int64_t>(5);
+	const int64_t section_adc         = prefix | static_cast<int64_t>(6);
+	const int64_t section_delays      = prefix | static_cast<int64_t>(7);
+	const int64_t section_shapes      = prefix | static_cast<int64_t>(8);
+	const int64_t section_extensions  = prefix | static_cast<int64_t>(9);
+	const int64_t section_triggers    = prefix | static_cast<int64_t>(10);
+	const int64_t section_labelset    = prefix | static_cast<int64_t>(11);
+	const int64_t section_labelinc    = prefix | static_cast<int64_t>(12);
+	const int64_t section_softdelays  = prefix | static_cast<int64_t>(13);
+	const int64_t section_rfshims     = prefix | static_cast<int64_t>(14);
+	const int64_t section_rotations   = prefix | static_cast<int64_t>(15);
+	const int64_t section_signature   = prefix | static_cast<int64_t>(0x00FFFFFF);
+
+	int64_t magic = 0;
+	if (!readScalar(data_stream, magic) || magic!=pulseqBinaryMagic()) {
+		print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Not a Pulseq binary file");
+		return false;
+	}
+
+	int64_t major = 0, minor = 0, revision = 0;
+	if (!readScalar(data_stream, major) || !readScalar(data_stream, minor) || !readScalar(data_stream, revision)) {
+		print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to decode binary file version");
+		return false;
+	}
+	version_major = static_cast<int>(major);
+	version_minor = static_cast<int>(minor);
+	version_revision = static_cast<int>(revision);
+	version_combined = version_major*1000000L + version_minor*1000L + version_revision;
+
+	while (true)
+	{
+		int64_t section = 0;
+		if (!readScalar(data_stream, section)) {
+			break;
+		}
+
+		switch (section)
 		{
-			print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to read file " << filepath);
-			return false;
+			case section_definitions:
+			{
+				int64_t numDefs = 0;
+				if (!readScalar(data_stream, numDefs)) {
+					print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to decode [DEFINITIONS] section header");
+					return false;
+				}
+				for (int64_t i=0; i<numDefs; ++i)
+				{
+					int32_t keyLen = 0;
+					if (!readScalar(data_stream, keyLen) || keyLen<0) {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Invalid key length in [DEFINITIONS]");
+						return false;
+					}
+					std::vector<char> keyData;
+					if (!readArray(data_stream, keyData, static_cast<size_t>(keyLen))) {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to read definition key");
+						return false;
+					}
+					std::string key(keyData.begin(), keyData.end());
+
+					int32_t valCount = 0;
+					char valType = 0;
+					if (!readScalar(data_stream, valCount) || valCount<0 || !readScalar(data_stream, valType)) {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Invalid value header in [DEFINITIONS]");
+						return false;
+					}
+
+					std::vector<double> vals;
+					std::string strValue;
+					std::ostringstream sv;
+					if (valType=='f') {
+						std::vector<double> data;
+						if (!readArray(data_stream, data, static_cast<size_t>(valCount))) {
+							print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to read float definition values");
+							return false;
+						}
+						vals = data;
+						for (int j=0; j<valCount; ++j) {
+							if (j>0) sv << " ";
+							sv << data[j];
+						}
+						strValue = sv.str();
+					}
+					else if (valType=='i') {
+						std::vector<int32_t> data;
+						if (!readArray(data_stream, data, static_cast<size_t>(valCount))) {
+							print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to read int definition values");
+							return false;
+						}
+						vals.resize(data.size());
+						for (size_t j=0; j<data.size(); ++j) {
+							vals[j] = static_cast<double>(data[j]);
+							if (j>0) sv << " ";
+							sv << data[j];
+						}
+						strValue = sv.str();
+					}
+					else if (valType=='c') {
+						std::vector<char> data;
+						if (!readArray(data_stream, data, static_cast<size_t>(valCount))) {
+							print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to read string definition values");
+							return false;
+						}
+						strValue.assign(data.begin(), data.end());
+						if (!strValue.empty() && strValue[strValue.size()-1]=='\0')
+							strValue = strValue.substr(0, strValue.size()-1);
+					}
+					else {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Unknown definition value type in [DEFINITIONS]");
+						return false;
+					}
+
+					m_definitions[key] = vals;
+					m_definitions_str[key] = strValue;
+				}
+				break;
+			}
+
+			case section_blocks:
+			{
+				int64_t numBlocks = 0;
+				if (!readScalar(data_stream, numBlocks) || numBlocks<0) {
+					print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to decode [BLOCKS] section header");
+					return false;
+				}
+				m_blocks.clear();
+				m_blockDurations_ru.clear();
+				for (int64_t i=0; i<numBlocks; ++i)
+				{
+					int64_t dur_ru = 0;
+					int32_t ids[6] = {0,0,0,0,0,0};
+					if (!readScalar(data_stream, dur_ru) || !readScalar(data_stream, ids[0]) || !readScalar(data_stream, ids[1]) ||
+						!readScalar(data_stream, ids[2]) || !readScalar(data_stream, ids[3]) || !readScalar(data_stream, ids[4]) ||
+						!readScalar(data_stream, ids[5])) {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to decode [BLOCKS] entry");
+						return false;
+					}
+					EventIDs events;
+					memset(events.id, 0, NUM_EVENTS*sizeof(int));
+					events.id[RF]  = ids[0];
+					events.id[GX]  = ids[1];
+					events.id[GY]  = ids[2];
+					events.id[GZ]  = ids[3];
+					events.id[ADC] = ids[4];
+					events.id[EXT] = ids[5];
+					m_blocks.push_back(events);
+					m_blockDurations_ru.push_back(static_cast<long>(dur_ru));
+				}
+				break;
+			}
+
+			case section_rf:
+			{
+				int64_t numEvents = 0;
+				if (!readScalar(data_stream, numEvents) || numEvents<0) return false;
+				m_rfLibrary.clear();
+				for (int64_t i=0; i<numEvents; ++i)
+				{
+					int32_t id=0, mag=0, phs=0, tsh=0;
+					double amp=0.0, fpp=0.0, ppp=0.0, foff=0.0, poff=0.0;
+					int64_t center_ps=0, delay_ps=0;
+					char use='u';
+					if (!readScalar(data_stream, id) || !readScalar(data_stream, amp) || !readScalar(data_stream, mag) ||
+						!readScalar(data_stream, phs) || !readScalar(data_stream, tsh) || !readScalar(data_stream, center_ps) ||
+						!readScalar(data_stream, delay_ps) || !readScalar(data_stream, fpp) || !readScalar(data_stream, ppp) ||
+						!readScalar(data_stream, foff) || !readScalar(data_stream, poff) || !readScalar(data_stream, use)) {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to decode [RF] entry");
+						return false;
+					}
+					RFEvent ev;
+					ev.amplitude   = static_cast<float>(amp);
+					ev.magShape    = static_cast<int>(mag);
+					ev.phaseShape  = static_cast<int>(phs);
+					ev.timeShape   = static_cast<int>(tsh);
+					ev.center      = static_cast<float>(center_ps*1e-6);
+					ev.delay       = static_cast<int>(ps_to_us_rounded(delay_ps));
+					ev.freqPPM     = static_cast<float>(fpp);
+					ev.phasePPM    = static_cast<float>(ppp);
+					ev.freqOffset  = static_cast<float>(foff);
+					ev.phaseOffset = static_cast<float>(poff);
+					ev.use         = use;
+					m_rfLibrary[id] = ev;
+				}
+				break;
+			}
+
+			case section_gradients:
+			{
+				int64_t numEvents = 0;
+				if (!readScalar(data_stream, numEvents) || numEvents<0) return false;
+				for (int64_t i=0; i<numEvents; ++i)
+				{
+					int32_t id=0, sid=0, tid=0;
+					double amp=0.0, first=0.0, last=0.0;
+					int64_t delay_ps=0;
+					if (!readScalar(data_stream, id) || !readScalar(data_stream, amp) || !readScalar(data_stream, first) ||
+						!readScalar(data_stream, last) || !readScalar(data_stream, sid) || !readScalar(data_stream, tid) ||
+						!readScalar(data_stream, delay_ps)) {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to decode [GRADIENTS] entry");
+						return false;
+					}
+					GradEvent ev;
+					ev.amplitude = static_cast<float>(amp);
+					ev.first = static_cast<float>(first);
+					ev.last = static_cast<float>(last);
+					ev.waveShape = sid;
+					ev.timeShape = tid;
+					ev.delay = static_cast<int>(ps_to_us_rounded(delay_ps));
+					ev.rampUpTime = ev.flatTime = ev.rampDownTime = 0;
+					m_gradLibrary[id] = ev;
+				}
+				break;
+			}
+
+			case section_trapezoids:
+			{
+				int64_t numEvents = 0;
+				if (!readScalar(data_stream, numEvents) || numEvents<0) return false;
+				for (int64_t i=0; i<numEvents; ++i)
+				{
+					int32_t id=0;
+					double amp=0.0;
+					int64_t rise_ps=0, flat_ps=0, fall_ps=0, delay_ps=0;
+					if (!readScalar(data_stream, id) || !readScalar(data_stream, amp) || !readScalar(data_stream, rise_ps) ||
+						!readScalar(data_stream, flat_ps) || !readScalar(data_stream, fall_ps) || !readScalar(data_stream, delay_ps)) {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to decode [TRAP] entry");
+						return false;
+					}
+					GradEvent ev;
+					ev.amplitude = static_cast<float>(amp);
+					ev.rampUpTime = ps_to_us_rounded(rise_ps);
+					ev.flatTime = ps_to_us_rounded(flat_ps);
+					ev.rampDownTime = ps_to_us_rounded(fall_ps);
+					ev.delay = static_cast<int>(ps_to_us_rounded(delay_ps));
+					ev.waveShape = 0;
+					ev.timeShape = 0;
+					ev.first = FLOAT_UNDEFINED;
+					ev.last = FLOAT_UNDEFINED;
+					m_gradLibrary[id] = ev;
+				}
+				break;
+			}
+
+			case section_adc:
+			{
+				int64_t numEvents = 0;
+				if (!readScalar(data_stream, numEvents) || numEvents<0) return false;
+				m_adcLibrary.clear();
+				for (int64_t i=0; i<numEvents; ++i)
+				{
+					int32_t id=0, phase_id=0;
+					int64_t num=0, dwell_ps=0, delay_ps=0;
+					double fpp=0.0, ppp=0.0, foff=0.0, poff=0.0;
+					if (!readScalar(data_stream, id) || !readScalar(data_stream, num) || !readScalar(data_stream, dwell_ps) ||
+						!readScalar(data_stream, delay_ps) || !readScalar(data_stream, fpp) || !readScalar(data_stream, ppp) ||
+						!readScalar(data_stream, foff) || !readScalar(data_stream, poff) || !readScalar(data_stream, phase_id)) {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to decode [ADC] entry");
+						return false;
+					}
+					ADCEvent ev;
+					ev.numSamples = static_cast<int>(num);
+					ev.dwellTime = ps_to_ns_rounded(dwell_ps);
+					ev.delay = static_cast<int>(ps_to_us_rounded(delay_ps));
+					ev.freqPPM = static_cast<float>(fpp);
+					ev.phasePPM = static_cast<float>(ppp);
+					ev.freqOffset = static_cast<float>(foff);
+					ev.phaseOffset = static_cast<float>(poff);
+					ev.phaseModulationShape = static_cast<int>(phase_id);
+					m_adcLibrary[id] = ev;
+				}
+				break;
+			}
+
+			case section_delays:
+			{
+				int64_t numEvents = 0;
+				if (!readScalar(data_stream, numEvents) || numEvents<0) return false;
+				m_tmpDelayLibrary.clear();
+				for (int64_t i=0; i<numEvents; ++i)
+				{
+					int32_t id=0;
+					int64_t delay_ps=0;
+					if (!readScalar(data_stream, id) || !readScalar(data_stream, delay_ps)) return false;
+					m_tmpDelayLibrary[id] = ps_to_us_rounded(delay_ps);
+				}
+				break;
+			}
+
+			case section_shapes:
+			{
+				int64_t numShapes = 0;
+				if (!readScalar(data_stream, numShapes) || numShapes<0) return false;
+				m_shapeLibrary.clear();
+				for (int64_t i=0; i<numShapes; ++i)
+				{
+					int32_t id=0;
+					int64_t numUncompressed=0, numCompressed=0;
+					if (!readScalar(data_stream, id) || !readScalar(data_stream, numUncompressed) || !readScalar(data_stream, numCompressed) ||
+						numUncompressed<0 || numCompressed<0) {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to decode [SHAPES] entry header");
+						return false;
+					}
+					std::vector<float> data;
+					if (!readArray(data_stream, data, static_cast<size_t>(numCompressed))) {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to decode [SHAPES] data");
+						return false;
+					}
+					CompressedShape shape;
+					shape.numUncompressedSamples = static_cast<int>(numUncompressed);
+					shape.isCompressed = (numCompressed != numUncompressed);
+					shape.samples = data;
+					m_shapeLibrary[id] = shape;
+				}
+				break;
+			}
+
+			case section_extensions:
+			{
+				int64_t numEvents = 0;
+				if (!readScalar(data_stream, numEvents) || numEvents<0) return false;
+				m_extensionLibrary.clear();
+				for (int64_t i=0; i<numEvents; ++i)
+				{
+					int32_t id=0;
+					int32_t type=0, ref=0, next=0;
+					if (!readScalar(data_stream, id) || !readScalar(data_stream, type) || !readScalar(data_stream, ref) || !readScalar(data_stream, next))
+						return false;
+					ExtensionListEntry ext;
+					ext.type = type;
+					ext.ref = ref;
+					ext.next = next;
+					m_extensionLibrary[id] = ext;
+				}
+				break;
+			}
+
+			case section_triggers:
+			{
+				int32_t ext_id = 0;
+				int64_t numEvents = 0;
+				if (!readScalar(data_stream, ext_id) || !readScalar(data_stream, numEvents) || numEvents<0) return false;
+				m_extensionNameIDs[ext_id] = std::make_pair(std::string("TRIGGERS"), EXT_TRIGGER);
+				m_triggerLibrary.clear();
+				for (int64_t i=0; i<numEvents; ++i)
+				{
+					int32_t id=0, type=0, channel=0;
+					int64_t delay_ps=0, duration_ps=0;
+					if (!readScalar(data_stream, id) || !readScalar(data_stream, type) || !readScalar(data_stream, channel) ||
+						!readScalar(data_stream, delay_ps) || !readScalar(data_stream, duration_ps)) return false;
+					TriggerEvent trig;
+					trig.triggerType = type;
+					trig.triggerChannel = channel;
+					trig.delay = ps_to_us_rounded(delay_ps);
+					trig.duration = ps_to_us_rounded(duration_ps);
+					m_triggerLibrary[id] = trig;
+				}
+				break;
+			}
+
+			case section_labelset:
+			case section_labelinc:
+			{
+				const ExtType exttype = (section==section_labelset) ? EXT_LABELSET : EXT_LABELINC;
+				const std::string extname = (section==section_labelset) ? "LABELSET" : "LABELINC";
+				std::map<int, LabelEvent>& lib = (section==section_labelset) ? m_labelsetLibrary : m_labelincLibrary;
+				int32_t ext_id = 0;
+				int64_t numEvents = 0;
+				if (!readScalar(data_stream, ext_id) || !readScalar(data_stream, numEvents) || numEvents<0) return false;
+				m_extensionNameIDs[ext_id] = std::make_pair(extname, static_cast<int>(exttype));
+				lib.clear();
+				for (int64_t i=0; i<numEvents; ++i)
+				{
+					int32_t id=0, value=0, labelIndex=0;
+					if (!readScalar(data_stream, id) || !readScalar(data_stream, value) || !readScalar(data_stream, labelIndex)) return false;
+					LabelEvent label;
+					int ret = decodeBinaryLabel(exttype, value, labelIndex, label);
+					if (ret<0)
+						return false;
+					if (ret==dl_ok)
+						lib[id] = label;
+				}
+				break;
+			}
+
+			case section_softdelays:
+			{
+				int32_t ext_id = 0;
+				int64_t numEvents = 0;
+				if (!readScalar(data_stream, ext_id) || !readScalar(data_stream, numEvents) || numEvents<0) return false;
+				m_extensionNameIDs[ext_id] = std::make_pair(std::string("DELAYS"), EXT_DELAY);
+				m_softDelayLibrary.clear();
+				for (int64_t i=0; i<numEvents; ++i)
+				{
+					int32_t id=0, num=0, hint_len=0;
+					int64_t offset_ps=0;
+					double factor=0.0;
+					if (!readScalar(data_stream, id) || !readScalar(data_stream, num) || !readScalar(data_stream, offset_ps) ||
+						!readScalar(data_stream, factor) || !readScalar(data_stream, hint_len) || hint_len<0) return false;
+					std::vector<char> hint_data;
+					if (!readArray(data_stream, hint_data, static_cast<size_t>(hint_len))) return false;
+					SoftDelayEvent d;
+					d.numID = num;
+					d.offset = static_cast<int>(ps_to_us_rounded(offset_ps));
+					d.factor = static_cast<float>(factor);
+					memset(d.hint, 0, SOFT_DELAY_HINT_LENGTH);
+					if (!hint_data.empty()) {
+						size_t copy_len = std::min(static_cast<size_t>(SOFT_DELAY_HINT_LENGTH-1), hint_data.size());
+						memcpy(d.hint, &hint_data[0], copy_len);
+					}
+					m_softDelayLibrary[id] = d;
+				}
+				break;
+			}
+
+			case section_rfshims:
+			{
+				int32_t ext_id = 0;
+				int64_t numEvents = 0;
+				if (!readScalar(data_stream, ext_id) || !readScalar(data_stream, numEvents) || numEvents<0) return false;
+				m_extensionNameIDs[ext_id] = std::make_pair(std::string("RF_SHIMS"), EXT_RF_SHIM);
+				m_rfShimLibrary.clear();
+				for (int64_t i=0; i<numEvents; ++i)
+				{
+					int32_t id=0, nchan=0;
+					if (!readScalar(data_stream, id) || !readScalar(data_stream, nchan) || nchan<0) return false;
+					std::vector<double> raw;
+					if (!readArray(data_stream, raw, static_cast<size_t>(2*nchan))) return false;
+					RfShimmingEvent shim;
+					shim.id = id;
+					shim.nchan = nchan;
+					shim.amplitudes.reserve(nchan);
+					shim.phases.reserve(nchan);
+					for (int c=0; c<nchan; ++c) {
+						shim.amplitudes.push_back(static_cast<float>(raw[2*c]));
+						shim.phases.push_back(static_cast<float>(raw[2*c+1]));
+					}
+					m_rfShimLibrary[id] = shim;
+				}
+				break;
+			}
+
+			case section_rotations:
+			{
+				int32_t ext_id = 0;
+				int64_t numEvents = 0;
+				if (!readScalar(data_stream, ext_id) || !readScalar(data_stream, numEvents) || numEvents<0) return false;
+				m_extensionNameIDs[ext_id] = std::make_pair(std::string("ROTATIONS"), EXT_ROTATION);
+				m_rotationLibrary.clear();
+				for (int64_t i=0; i<numEvents; ++i)
+				{
+					int32_t id=0;
+					double q[4] = {0,0,0,0};
+					if (!readScalar(data_stream, id) || !readScalar(data_stream, q[0]) || !readScalar(data_stream, q[1]) ||
+						!readScalar(data_stream, q[2]) || !readScalar(data_stream, q[3])) return false;
+					double n = sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+					if (n<=0.0)
+						return false;
+					RotationEvent rot;
+					rot.defined = true;
+					for (int j=0; j<4; ++j)
+						rot.rotQuaternion[j] = q[j]/n;
+					m_rotationLibrary[id] = rot;
+				}
+				break;
+			}
+
+			case section_signature:
+			{
+				int32_t type_len = 0;
+				if (!readScalar(data_stream, type_len) || type_len<0) return false;
+				std::vector<char> type_chars;
+				if (!readArray(data_stream, type_chars, static_cast<size_t>(type_len))) return false;
+				std::string sigType(type_chars.begin(), type_chars.end());
+
+				int32_t hash_len = 0;
+				if (!readScalar(data_stream, hash_len) || hash_len<0) return false;
+				std::vector<unsigned char> hash;
+				if (!readArray(data_stream, hash, static_cast<size_t>(hash_len))) return false;
+
+				int64_t original_size = 0;
+				if (!readScalar(data_stream, original_size)) return false;
+
+				std::ostringstream oss;
+				oss << std::hex << std::setfill('0');
+				for (size_t i=0; i<hash.size(); ++i)
+					oss << std::setw(2) << static_cast<unsigned int>(hash[i]);
+
+				m_bSignatureDefined = !hash.empty();
+				m_strSignature = str_tolower(oss.str());
+				m_strSignatureType = str_tolower(sigType);
+				(void)original_size;
+				break;
+			}
+
+			default:
+				print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Unknown binary section code: " << std::hex << section);
+				return false;
 		}
+	}
 
-		if (!load(data_file, lm_shapes)) {
-			print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to load shapes from file " << filepath);
-			return false;
-		}
+	if (!data_stream.eof()) {
+		print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Unexpected EOF/stream error while reading binary file");
+		return false;
+	}
 
-		filepath = path + PATH_SEPARATOR + "events.seq";
-		data_file.close();
-		data_file.open(filepath.c_str(), std::ios::in | std::ios::binary);
-		data_file.seekg(0, std::ios::beg);
-
-		if (!data_file.good())
-		{
-			print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to read file " << filepath);
-			return false;
-		}
-
-		if (!load(data_file, lm_events)) {
-			print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to load events from file " << filepath);
-			return false;
-		}
-
-		filepath = path + PATH_SEPARATOR + "blocks.seq";
-		data_file.close();
-		data_file.open(filepath.c_str(), std::ios::in | std::ios::binary);
-		data_file.seekg(0, std::ios::beg);
-
-		if (!data_file.good())
-		{
-			print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to read file " << filepath);
-			return false;
-		}
-		
-		if (!load(data_file, lm_blocks)) {
-			print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Failed to load blocks from file " << filepath);
-			return false;
-		}
-
-		return true;
+	// Raster times and required definitions/extensions as in the text loader
+	if (version_combined<1004000L)
+	{
+		m_dAdcRasterTime_us=1e-1;
+		m_dGradientRasterTime_us=10.0;
+		m_dRadiofrequencyRasterTime_us=1.0;
+		m_dBlockDurationRaster_us = m_dGradientRasterTime_us;
 	}
 	else
 	{
-		return load(data_file);
+		std::vector<double> def = GetDefinition("AdcRasterTime");
+		if (def.empty()) { print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Required: definition AdcRasterTime is not present in the file"); return false; }
+		m_dAdcRasterTime_us=1e6*def[0];
+		def = GetDefinition("GradientRasterTime");
+		if (def.empty()) { print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Required: definition GradientRasterTime is not present in the file"); return false; }
+		m_dGradientRasterTime_us=1e6*def[0];
+		def = GetDefinition("RadiofrequencyRasterTime");
+		if (def.empty()) { print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Required: definition RadiofrequencyRasterTime is not present in the file"); return false; }
+		m_dRadiofrequencyRasterTime_us=1e6*def[0];
+		def = GetDefinition("BlockDurationRaster");
+		if (def.empty()) { print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Required: definition BlockDurationRaster is not present in the file"); return false; }
+		m_dBlockDurationRaster_us=1e6*def[0];
+
+		if (version_combined >= 1005001L)
+		{
+			std::string req = GetDefinitionStr("RequiredExtensions");
+			while (!req.empty())
+			{
+				std::string ext = "";
+				int p = req.find(' ');
+				if (p>=0) {
+					ext = req.substr(0,p);
+					req = req.substr(p+1);
+				}
+				else {
+					ext = req;
+					req = "";
+				}
+				if (ext != "TRIGGERS" && ext != "ROTATIONS" && ext != "LABELSET" && ext != "LABELINC" && ext != "DELAYS" && ext != "RF_SHIMS") {
+					print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: The extension '" << ext << "' is unknown to this interpreter but is defined as REQUIRED in the sequence file");
+					return false;
+				}
+			}
+		}
 	}
+
+	SeqBlock::s_blockDurationRaster = m_dBlockDurationRaster_us;
+
+	for (size_t b=0; b<m_blocks.size(); ++b)
+	{
+		if (!checkBlockReferences(m_blocks[b])) {
+			print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Block " << b << " contains references to undefined events");
+			return false;
+		}
+	}
+
+	m_bSignatureCheckSucceeded = false;
+	return true;
+}
+
+int ExternalSequence::decodeBinaryLabel(ExtType exttype, int value, int labelIndex, LabelEvent& label)
+{
+	static const char* supported_labels[] = {
+		"SLC","SEG","REP","AVG","SET","ECO","PHS","LIN","PAR","ACQ","TRID",
+		"NAV","REV","SMS","REF","IMA","OFF","NOISE","PMC","NOROT","NOPOS","NOSCL","ONCE"
+	};
+	const int nLabels = static_cast<int>(sizeof(supported_labels)/sizeof(supported_labels[0]));
+	if (labelIndex<1 || labelIndex>nLabels) {
+		print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Invalid binary label index: " << labelIndex);
+		return dl_error;
+	}
+
+	char buf[SOFT_DELAY_HINT_LENGTH];
+	memset(buf, 0, sizeof(buf));
+	strncpy(buf, supported_labels[labelIndex-1], sizeof(buf)-1);
+	int val = value;
+	return decodeLabel(exttype, val, buf, label);
 }
 
 bool ExternalSequence::load_from_buffer(char * buffer) 
 {
 	print_msg(DEBUG_HIGH_LEVEL, std::ostringstream().flush() << "Loading sequence from a text buffer");
 
-	// Try single file mode (everything in a single .seq file)
+	// Single-file mode (everything in a single buffer)
 	std::istringstream string_stream(buffer);
 	string_stream.seekg(0, std::ios::beg);
 	return load(string_stream);
@@ -176,6 +852,7 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 	{
 		reset();
 	}
+	bIsBinary = false;
 
 	if (!data_stream.good())
 	{
@@ -314,6 +991,7 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 	
 	if (loadMode == lm_singlefile || loadMode == lm_events) 
 	{
+		print_msg(DEBUG_HIGH_LEVEL, std::ostringstream().flush() << "reading RF section");
 		// Read RF section
 		// ------------------------
 		if (m_fileIndex.find("[RF]") != m_fileIndex.end()) {
@@ -328,6 +1006,7 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 				RFEvent event;
 				if (version_combined<1004000L)
 				{
+					// pre v1.4.0
 					if (7!=sscanf(buffer, "%d%f%d%d%d%f%f", &rfId, &(event.amplitude),
 								&(event.magShape),&(event.phaseShape), &(event.delay),
 								&(event.freqOffset), &(event.phaseOffset)
@@ -335,24 +1014,46 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode RF event\n" << buffer << std::endl );
 						return false;
 					}
-					event.timeShape=0;
+                    event.freqPPM=0.0;
+                    event.phasePPM = 0.0;
+                    event.timeShape = 0;
+					event.use='u'; // undefined use
+					event.center=-1.0; // mark as invalid
 				}
-				else
+				else if (version_combined < 1005000) 
 				{
+					// 1.4.0
 					if (8!=sscanf(buffer, "%d%f%d%d%d%d%f%f", &rfId, &(event.amplitude),
-								&(event.magShape),&(event.phaseShape),&(event.timeShape),&(event.delay),
-								&(event.freqOffset), &(event.phaseOffset)
+								&(event.magShape), &(event.phaseShape), &(event.timeShape),
+								&(event.delay), &(event.freqOffset), &(event.phaseOffset)
+								)) {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode RF event\n" << buffer << std::endl );
+						return false;
+					}
+                    event.freqPPM = 0.0;
+                    event.phasePPM = 0.0;
+                    event.use       = 'u';  // undefined use
+					event.center=-1.0; // mark as invalid
+				}
+				else 
+				{
+					// 1.5.0
+					if (12!=sscanf(buffer, "%d%f%d%d%d%f%d%f%f%f%f %c", &rfId, &(event.amplitude),
+								&(event.magShape),&(event.phaseShape), &(event.timeShape), &(event.center),
+								&(event.delay), &(event.freqPPM), &(event.phasePPM), &(event.freqOffset), &(event.phaseOffset), &(event.use)
 								)) {
 						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode RF event\n" << buffer << std::endl );
 						return false;
 					}
 				}
 				m_rfLibrary[rfId] = event;
+                ExternalSequence::print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "m_rfLibrary["<<rfId<<"].use="<<event.use);
 			}
 		}
 		
 		// Read *arbitrary* gradient section
 		// -------------------------------
+		print_msg(DEBUG_HIGH_LEVEL, std::ostringstream().flush() << "reading arbitrary gradient section");
 		m_gradLibrary.clear();
 		if (m_fileIndex.find("[GRADIENTS]") != m_fileIndex.end()) {
 			data_stream.seekg(m_fileIndex["[GRADIENTS]"], std::ios::beg);
@@ -361,29 +1062,47 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 				if (buffer[0]=='[' || strlen(buffer)==0) {
 					break;
 				}
+				print_msg(DEBUG_HIGH_LEVEL, std::ostringstream().flush() << "got line: " << buffer);
 				int gradId;
 				GradEvent event;
-				if ( version_combined>=1004000L )
+				if ( version_combined>=1005000L )
 				{
-					if (5!=sscanf(buffer, "%d%f%d%d%d", &gradId, &(event.amplitude), &(event.waveShape), &(event.timeShape), &(event.delay))) {
+					// v1.5.0
+					if (7!=sscanf(buffer, "%d%f%f%f%d%d%d", &gradId, &(event.amplitude), &(event.first), &(event.last), &(event.waveShape), &(event.timeShape), &(event.delay))) {
 						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode v1.4.x gradient event\n" << buffer << std::endl );
 						return false;
 					}
 				}
+				else if ( version_combined>=1004000L )
+				{
+					// v1.4.0
+					if (5!=sscanf(buffer, "%d%f%d%d%d", &gradId, &(event.amplitude), &(event.waveShape), &(event.timeShape), &(event.delay))) {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode v1.4.x gradient event\n" << buffer << std::endl );
+						return false;
+					}
+					event.first=FLOAT_UNDEFINED; // std::numeric_limits<float>::quiet_NaN(); <- did not work with older MSVC
+					event.last=FLOAT_UNDEFINED; // std::numeric_limits<float>::quiet_NaN(); <- did not work with older MSVC
+				}
 				else
 				{
+					// pre v1.4.0
 					event.timeShape=0;
 					if (4!=sscanf(buffer, "%d%f%d%d", &gradId, &(event.amplitude), &(event.waveShape), &(event.delay))) {
 						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode v1.2.x gradient event\n" << buffer << std::endl );
 						return false;
 					}
+					event.first=FLOAT_UNDEFINED; // std::numeric_limits<float>::quiet_NaN(); <- did not work with older MSVC
+					event.last=FLOAT_UNDEFINED; // std::numeric_limits<float>::quiet_NaN(); <- did not work with older MSVC
 				}
+				print_msg(DEBUG_HIGH_LEVEL, std::ostringstream().flush() << "assigning the event to the library under the ID " << gradId);
 				m_gradLibrary[gradId] = event;
+				print_msg(DEBUG_HIGH_LEVEL, std::ostringstream().flush() << "done");
 			}
 		}
 
 		// Read *trapezoid* gradient section
 		// -------------------------------
+		print_msg(DEBUG_HIGH_LEVEL, std::ostringstream().flush() << "reading trapezoids section");
 		if (m_fileIndex.find("[TRAP]") != m_fileIndex.end()) {
 			data_stream.seekg(m_fileIndex["[TRAP]"], std::ios::beg);
 
@@ -410,6 +1129,7 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 
 		// Read ADC section
 		// -------------------------------
+		print_msg(DEBUG_HIGH_LEVEL, std::ostringstream().flush() << "reading ADC section");
 		if (m_fileIndex.find("[ADC]") != m_fileIndex.end()) {
 			data_stream.seekg(m_fileIndex["[ADC]"], std::ios::beg);
 
@@ -420,11 +1140,28 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 					break;
 				}
 				ADCEvent event;
-				if (6!=sscanf(buffer, "%d%d%d%d%f%f", &adcId, &(event.numSamples),
-							&(event.dwellTime),&(event.delay),&(event.freqOffset),&(event.phaseOffset))) {
-					print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode ADC event\n" << buffer << std::endl );
-					return false;
+				if ( version_combined>=1005000L )
+				{
+					// v1.5.0
+					if (9!=sscanf(buffer, "%d%d%d%d%f%f%f%f%d", &adcId, &(event.numSamples),
+								&(event.dwellTime),&(event.delay),&(event.freqPPM),&(event.phasePPM),&(event.freqOffset),&(event.phaseOffset),&(event.phaseModulationShape))) {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode ADC event\n" << buffer << std::endl );
+						return false;
+					}
 				}
+				else
+				{
+					// v1.4.0 and older
+					if (6!=sscanf(buffer, "%d%d%d%d%f%f", &adcId, &(event.numSamples),
+								&(event.dwellTime),&(event.delay),&(event.freqOffset),&(event.phaseOffset))) {
+						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode ADC event\n" << buffer << std::endl );
+						return false;
+					}
+                    event.freqPPM=0.0; // no ppmOffset in older formats
+                    event.phasePPM= 0.0; 
+					event.phaseModulationShape=0; // no phase modulation shape provided 
+				}
+				
 				m_adcLibrary[adcId] = event;
 			}
 		}
@@ -434,6 +1171,7 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 		//std::map<int,long> tmpDelayLibrary;
 		m_tmpDelayLibrary.clear();
 		if (m_fileIndex.find("[DELAYS]") != m_fileIndex.end()) {
+			print_msg(DEBUG_HIGH_LEVEL, std::ostringstream().flush() << "reading DELAYS section (compatibility)");
 			data_stream.seekg(m_fileIndex["[DELAYS]"], std::ios::beg);
 
 			int delayId;
@@ -452,6 +1190,7 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 
 		// Read extensions section
 		// -------------------------------
+		print_msg(DEBUG_HIGH_LEVEL, std::ostringstream().flush() << "reading and processing extensions");
 		m_extensionLibrary.clear();
 		m_extensionNameIDs.clear();
 		m_triggerLibrary.clear(); // clear also all known extension libraries
@@ -487,7 +1226,7 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 						print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode extension header entry\n" << buffer << std::endl );
 						return false;
 					}
-					// here is the list if extensions we currently recognize
+					// here is the list of extensions we currently recognize
 					if (0==strcmp("TRIGGERS",szStrID))
 						nKnownID=EXT_TRIGGER;
 					else if (0==strcmp("ROTATIONS",szStrID))
@@ -496,6 +1235,10 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 						nKnownID=EXT_LABELSET;
 					else if (0==strcmp("LABELINC",szStrID))
 						nKnownID=EXT_LABELINC;
+					else if (0==strcmp("DELAYS",szStrID))
+						nKnownID=EXT_DELAY;
+					else if (0==strcmp("RF_SHIMS",szStrID))
+						nKnownID=EXT_RF_SHIM;
 					if (nKnownID!=EXT_UNKNOWN)
 						m_extensionNameIDs[nInternalID]=std::make_pair(std::string(szStrID),nKnownID);
 					else {
@@ -508,13 +1251,15 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 					ExtensionListEntry extEntry;
 					TriggerEvent trigger;
 					RotationEvent rotation;
+					SoftDelayEvent delay;
+                    RfShimmingEvent rfShim;
 					int  nVal;					   // read label set/inc values from label set/inc extension
 					int  nRet;                     // conversion result / return value
 					char szLabelID[MAX_LINE_SIZE]; // read labels strings from label set/inc extension
 					LabelEvent	label;			   // write label event
 					switch (nExtensionID) {
 						case EXT_LIST: 
-							if (4!=sscanf(buffer, "%d%d%d%ld", &nID, &(extEntry.type), &(extEntry.ref), &(extEntry.next))) {
+							if (4!=sscanf(buffer, "%d%d%d%d", &nID, &(extEntry.type), &(extEntry.ref), &(extEntry.next))) {
 								print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode extension list entry\n" << buffer << std::endl );
 								return false;
 							}
@@ -530,13 +1275,19 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 							m_triggerLibrary[nID] = trigger;
 							break;
 						case EXT_ROTATION: 
-							if (10!=sscanf(buffer, "%d%lf%lf%lf%lf%lf%lf%lf%lf%lf", &nID, 
-										&rotation.rotMatrix[0], &rotation.rotMatrix[1], &rotation.rotMatrix[2],
-										&rotation.rotMatrix[3], &rotation.rotMatrix[4], &rotation.rotMatrix[5],
-										&rotation.rotMatrix[6], &rotation.rotMatrix[7], &rotation.rotMatrix[8])) {
+							if (5!=sscanf(buffer, "%d%lf%lf%lf%lf", &nID, &rotation.rotQuaternion[0], &rotation.rotQuaternion[1], &rotation.rotQuaternion[2], &rotation.rotQuaternion[3])) {
 								print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode rotation event\n" << buffer << std::endl );
-								return false;
+                                return false;
 							}
+                            {
+								double dNorm=sqrt(rotation.rotQuaternion[0]*rotation.rotQuaternion[0]+rotation.rotQuaternion[1]*rotation.rotQuaternion[1]+rotation.rotQuaternion[2]*rotation.rotQuaternion[2]+rotation.rotQuaternion[3]*rotation.rotQuaternion[3]);
+                                if (fabs(dNorm-1.0)>1e-3) {
+									print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: rotation extension loaded a non-normalized quaternion " << buffer << std::endl );
+									return false;
+								}
+								for (int i = 0; i < 4; ++i)
+                                    rotation.rotQuaternion[i] /= dNorm; 
+                            }
 							rotation.defined=true;
 							m_rotationLibrary[nID] = rotation; 
 							break;
@@ -549,10 +1300,11 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 							if (nRet<0) {
 								print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode labelset event\n" << buffer << std::endl );
 								return false;
-							}else if(nRet>0) {
-								print_msg(ERROR_MSG, std::ostringstream().flush() << "*** decoding labelset event returned 0\n" << buffer << std::endl );
-							} 
-							m_labelsetLibrary[nID] = label;
+							}else if(nRet==dl_ok) {
+                                m_labelsetLibrary[nID] = label;
+							} else if(nRet==dl_unknown) {
+								print_msg(ERROR_MSG, std::ostringstream().flush() << "*** decoding labelset event returned dl_unknown\n" << buffer << std::endl );
+							}							
 							break;
 						case EXT_LABELINC: 
 							if (3!=sscanf(buffer, "%d%d%s", &nID, &nVal, szLabelID)) {
@@ -563,42 +1315,67 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 							if (nRet<0) {
 								print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode labelinc event\n" << buffer << std::endl );
 								return false;
-							}else if(nRet>0) {
-								print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: decoding labelinc event returnd 0\n" << buffer << std::endl );
+							}else if(nRet==dl_ok) {
+                                m_labelincLibrary[nID] = label;
+							} else if(nRet==dl_unknown) {
+								print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: decoding labelinc event returnd dl_unknown\n" << buffer << std::endl );
 							}
-
-							m_labelincLibrary[nID] = label;
 							break;
+						case EXT_DELAY: 
+							{
+								int n=0;
+								if (4!=sscanf(buffer, "%d%d%d%f%n", &nID, &(delay.numID), &(delay.offset), &(delay.factor), &n)) {
+									print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode soft delay event\n" << buffer << std::endl );
+									return false;
+								}
+								strncpy(delay.hint,stripWhiteSpace(buffer+n),SOFT_DELAY_HINT_LENGTH);
+								delay.hint[SOFT_DELAY_HINT_LENGTH-1]=0;
+								print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "decoded soft delay " << delay.numID << " with the hint:" << delay.hint);
+								m_softDelayLibrary[nID] = delay;
+							}
+							break;
+                        case EXT_RF_SHIM:
+                            {
+								int nPos=0; 
+								if (2!= sscanf(buffer, "%d%d%n", &rfShim.id, &(rfShim.nchan), &(nPos)))
+                                {
+                                    print_msg(
+                                        ERROR_MSG,
+                                        std::ostringstream().flush() << "*** ERROR: failed to decode RF shim event\n"
+                                                                     << buffer << std::endl);
+                                    return false;
+                                }
+								print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "decoded initial part of the RF shim event, id:" << rfShim.id << " nChan:" << rfShim.nchan << " curren position:" << nPos);
+								rfShim.amplitudes.reserve(rfShim.nchan);
+								rfShim.phases.reserve(rfShim.nchan);
+								int n=nPos;
+								for (int i=0;i<rfShim.nchan; ++i) 
+								{
+									float fa,fp;
+									if (2!= sscanf(buffer+n, "%f%f%n", &(fa), &(fp), &(nPos)))
+									{
+										print_msg(
+											ERROR_MSG,
+											std::ostringstream().flush() << "*** ERROR: failed to decode RF shim event for channel " << i << " in\n"
+																		 << buffer << std::endl);
+										return false;
+									}
+									print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "decoded a further part of the RF shim event, fa:" << fa << " fp:" << fp << " curren position:" << n+nPos);
+									rfShim.amplitudes.push_back(fa);
+									rfShim.phases.push_back(fp);								
+									n+=nPos;
+								}
+								print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "finished decoding RF shim event");
+                                m_rfShimLibrary[rfShim.id] = rfShim;
+                            }
+                            break;
 						case EXT_UNKNOWN:
+							print_msg(WARNING_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode unknown extension event\n" << buffer << std::endl );
 							break; // just ignore unknown extensions
 					}
 				}
 			}
-		}
-		
-		// Read gradient rotation section
-		// -------------------------------
-		/*if (m_fileIndex.find("[ROTATIONS]") != m_fileIndex.end()) {
-			data_stream.seekg(m_fileIndex["[ROTATIONS]"], std::ios::beg);
-
-			int controlId;
-			while (getline(data_stream, buffer, MAX_LINE_SIZE)) {
-				if (buffer[0]=='[' || strlen(buffer)==0) {
-					break;
-				}
-				ControlEvent event;
-				event.type = ControlEvent::ROTATION;
-				if (10!=sscanf(buffer, "%d%lf%lf%lf%lf%lf%lf%lf%lf%lf", &controlId, 
-							&event.rotMatrix[0], &event.rotMatrix[1], &event.rotMatrix[2],
-							&event.rotMatrix[3], &event.rotMatrix[4], &event.rotMatrix[5],
-							&event.rotMatrix[6], &event.rotMatrix[7], &event.rotMatrix[8])) {
-					print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: failed to decode rotation event\n" << buffer << std::endl );
-					return false;
-				}
-				m_controlLibrary[controlId] = event;
-			}
-		}*/
-		
+		}		
 		
 		print_msg(DEBUG_HIGH_LEVEL, std::ostringstream().flush() << "-- EVENTS READ: "
 			<<" RF: " << m_rfLibrary.size()
@@ -718,6 +1495,44 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 				return false;
 			}
 			m_dBlockDurationRaster_us=1e6*def[0];
+
+			// from 1.5.1 on we have a concept of required extensions, that is 
+			// the sequence may optionally declare a list of extensions that must be known to the interpreter, 
+			// otherwise it must deny loading the sequence
+            if (version_combined >= 1005001L)
+            {
+                std::string def = GetDefinitionStr("RequiredExtensions");
+                while (!def.empty())
+                {
+					// def contains all required extensions, we just extract the first and trim the line
+                    std::string extStrID1 = "";
+                    int p = def.find(' ');
+                    if (p >= 0)
+                    {
+                        extStrID1 = def.substr(0, p);
+                        def=def.substr(p+1);
+                    }
+                    else
+                    {
+                        extStrID1 = def;
+                        def = "";
+                    }
+                    print_msg(
+                        DEBUG_LOW_LEVEL,
+                        std::ostringstream().flush() << "-- ckecking required extension '" << extStrID1 << "'");
+					// this is a very ugly code, as it explicitly defines the extension strings here and also in a different place. TODO: FixMe by introducing a data structure that serves both purposes
+					if (extStrID1 != "TRIGGERS" &&
+						extStrID1 != "ROTATIONS" &&
+						extStrID1 != "LABELSET" &&
+						extStrID1 != "LABELINC" &&
+						extStrID1 != "DELAYS" &&
+						extStrID1 != "RF_SHIMS") 
+					{
+                        print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: The extension '" << extStrID1 << "' is unknown to this interpreter but is defined as REQUIRED in the sequence file");
+						return false;
+					}
+                }
+            }
 		}
 		SeqBlock::s_blockDurationRaster=m_dBlockDurationRaster_us;
 
@@ -744,7 +1559,7 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 			memset(events.id, 0, NUM_EVENTS*sizeof(int));
 			long dur_ru =0;
 
-			int ret=sscanf(buffer, "%d%d%d%d%d%d%d%d", &blockIdx,
+			int ret=sscanf(buffer, "%d%ld%d%d%d%d%d%d", &blockIdx,
 					&dur_ru,                                        // block duration
 					&events.id[RF],                                 // RF
 					&events.id[GX],&events.id[GY],&events.id[GZ],   // Gradients
@@ -810,13 +1625,30 @@ bool ExternalSequence::load(std::istream& data_stream, load_mode loadMode /*=lm_
 			// convert the relevant field(s) into the internal structure(s)
 			if (m_signatureMap.count("Hash")>0) {
 				m_bSignatureDefined = true;
-				m_strSignature = m_signatureMap["Hash"];
+				m_strSignature = str_tolower(m_signatureMap["Hash"]);
 				if (m_signatureMap.count("Type")>0) 
-					m_strSignatureType = m_signatureMap["Type"];
+					m_strSignatureType = str_tolower(m_signatureMap["Type"]);
 			}
 		} // if signature exists
 
 		print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "--- Finished reading signature");
+
+		m_bSignatureCheckSucceeded=false;
+		if (!m_bSignatureDefined) {
+			print_msg(NORMAL_MSG, std::ostringstream().flush() << "signature block not found");
+		}
+		else
+		{
+			if (m_strSignatureType!="md5") {
+				print_msg(NORMAL_MSG, std::ostringstream().flush() << "signature validation is not supported for " << m_strSignatureType);
+			}
+			else {
+				m_bSignatureCheckSucceeded=(m_strSignature==m_strCalculatedMD5Signature);
+				if (!m_bSignatureCheckSucceeded){
+					print_msg(WARNING_MSG, std::ostringstream().flush() << "WARNING: signature validation failed! stored signature: " << m_strSignature << "; calculated hash: " << m_strCalculatedMD5Signature);
+				}
+			}
+		}
 
 		if (version_combined<1004000L) 
 		{
@@ -898,22 +1730,87 @@ void ExternalSequence::skipComments(std::istream &fileStream, char *buffer)
 
 
 /***********************************************************/
+char* ExternalSequence::stripWhiteSpace(char *buffer)
+{
+	while (*buffer && (*buffer==' ' || *buffer=='\t')) 
+		buffer+=1;
+	int n=strlen(buffer);
+	while (n>0 && (buffer[n]==' ' || buffer[n]=='\t' || buffer[n]=='\r' || buffer[n]=='\n')) {
+		buffer[n]=0;
+		n-=1;
+	}
+	return buffer;
+};
+
+
+/***********************************************************/
 void ExternalSequence::buildFileIndex(std::istream &fileStream)
 {
 	char buffer[MAX_LINE_SIZE];
-	
-	while (getline(fileStream, buffer, MAX_LINE_SIZE)) {
-		std::string line = std::string(buffer);
+    char* pBr;
+    struct MD5Context mdc;
+    unsigned char dg[16];
+    MD5Init(&mdc);
+    bool bSignatureSectionFound = false;
+    std::string strippedLine;
+    		
+	while (getline(fileStream, buffer, MAX_LINE_SIZE, true)) {		
 		//ExternalSequence::print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "buildFileIndex(): read line: [" << line << "]");
-		if (line[0]=='[' && line[line.length()-1]==']') {
-			m_fileIndex[line] = fileStream.tellg();
-			m_fileSections.insert(fileStream.tellg());			
+		if (buffer[0]=='[' ) {
+            //print_msg(NORMAL_MSG, std::ostringstream().flush() << "opening bracket found in " << buffer);
+            pBr=strchr(buffer+1,']');
+			if (pBr) {
+                std::string line  = std::string(buffer, pBr - buffer + 1);
+                //print_msg(NORMAL_MSG, std::ostringstream().flush() << "closing bracket found, line " << line);
+                m_fileIndex[line] = fileStream.tellg();
+                m_fileSections.insert(fileStream.tellg());
+                if (line == "[SIGNATURE]") {
+                    bSignatureSectionFound = true;
+                    // not on vb17 // strippedLine.clear();
+					strippedLine="";
+					//print_msg(NORMAL_MSG, std::ostringstream().flush() << "signature block found");
+				}
+			}
 		}
+        if (!bSignatureSectionFound) {
+            if (!strippedLine.empty())
+                MD5Update(&mdc, (unsigned char*)strippedLine.c_str(), strippedLine.length());
+            if (0==strcmp(buffer, "\n") || 0==strcmp(buffer, "\r\n"))
+                strippedLine = buffer;
+			else {
+                MD5Update(&mdc, (unsigned char*)buffer, strlen(buffer));
+                // not on vb17 // strippedLine.clear();
+				strippedLine="";
+			}
+		}			
 	}
 	m_fileSections.insert(fileStream.tellg()); // add the end-of-file (+1?)
 	fileStream.clear();		// reset EOF flag
 	fileStream.seekg(0, std::ios::beg);
+    if (!strippedLine.empty())
+        MD5Update(&mdc, (unsigned char*)strippedLine.c_str(), strippedLine.length());
+    // finalize the MD5 hash calculation
+	MD5Final(dg, &mdc);
+    char hash[33];
+    sprintf(hash,"%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",dg[0],dg[1],dg[2],dg[3],dg[4],dg[5],dg[6],dg[7],dg[8],dg[9],dg[10],dg[11],dg[12],dg[13],dg[14],dg[15]);
+    print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "calculated md5 hash of the current pulseq file is: " << hash);
+	m_strCalculatedMD5Signature=hash;    
 };
+
+
+std::vector<std::string> ExternalSequence::GetAllDefinitions()
+{
+    assert(m_definitions_str.size() == m_definitions.size());
+    int n = m_definitions_str.size();
+    std::vector<std::string> keys(n);
+    std::map<std::string, std::string>::iterator it = m_definitions_str.begin();
+    for (int i = 0; i < n; ++i)
+    {
+        keys[i] = it->first;
+        ++it;
+	}
+    return keys;
+}
 
 /***********************************************************/
 SeqBlock*	ExternalSequence::GetBlock(int index) {
@@ -934,6 +1831,10 @@ SeqBlock*	ExternalSequence::GetBlock(int index) {
 	block->rotation.defined=false;
 	block->labelset.clear();
 	block->labelinc.clear();
+	block->softDelay.numID=-1;
+	block->actualSoftDelay_ru=-1;
+	block->rfShim.nchan=-1;
+	block->rfShim.id=0;
 	// Set event structures (if applicable) so e.g. gradient type can be determined
 	if (events.id[RF]>0)     block->rf      = m_rfLibrary[events.id[RF]];
 	if (events.id[ADC]>0)    block->adc     = m_adcLibrary[events.id[ADC]];
@@ -973,15 +1874,43 @@ SeqBlock*	ExternalSequence::GetBlock(int index) {
 							block->rotation=m_rotationLibrary[itEL->second.ref]; // do we have to check whether it can be found?
 						}
 						break;
-					case EXT_LABELSET:
-						//do we have to check anything ? //MZ: TODO: check that we find the evet in the library TODO: check for conflicts between set and inc
-							// ok, lets find the labelset in the library
-							block->labelset.push_back(m_labelsetLibrary[itEL->second.ref]); // do we have to check whether it can be found?
+					case EXT_LABELSET: 
+						{
+							//do we have to check anything ? yes, if we ignore some labels they will not be in the library, but will be in the time table
+						    // old code : block->labelset.push_back(m_labelsetLibrary[itEL->second.ref]); // do we have to check whether it can be found?
+                            std::map<int, LabelEvent>::const_iterator itLBL = m_labelsetLibrary.find(itEL->second.ref);
+                            if (itLBL!=m_labelsetLibrary.end())
+								block->labelset.push_back(itLBL->second);
+							// MZ: TODO: check for conflicts between set and inc
+						}
 						break;
 					case EXT_LABELINC:
-						//do we have to check anything ? //MZ: TODO: check that we find the evet in the library TODO: check for conflicts between set and inc
-							// ok, lets find the labelinc in the library
-							block->labelinc.push_back(m_labelincLibrary[itEL->second.ref]); // do we have to check whether it can be found?
+                        {
+							// do we have to check anything ? yes, if we ignore some labels they will not be in the library, but will be in the time table
+							// old code : block->labelinc.push_back(m_labelincLibrary[itEL->second.ref]); // do we have to check whether it can be found?
+                            std::map<int, LabelEvent>::const_iterator itLBL = m_labelincLibrary.find(itEL->second.ref);
+                            if (itLBL != m_labelincLibrary.end())
+                                block->labelinc.push_back(itLBL->second);
+							// MZ: TODO: check for conflicts between set and inc
+						}
+						break;
+					case EXT_DELAY:
+						if (block->softDelay.numID>=0) {
+							print_msg(WARNING_MSG, std::ostringstream().flush() << "*** WARNING: only one soft delay per block is supported; error block: " << index );
+						}
+						else {
+							// ok, lets find the soft delay in the library
+							block->softDelay=m_softDelayLibrary[itEL->second.ref]; // do we have to check whether it can be found?
+						}
+						break;
+					case EXT_RF_SHIM:
+						if (block->rfShim.nchan>0) {
+							print_msg(WARNING_MSG, std::ostringstream().flush() << "*** WARNING: only one soft delay per block is supported; error block: " << index );
+						}
+						else {
+							// ok, lets find the RF shim event in the library
+							block->rfShim=m_rfShimLibrary[itEL->second.ref]; // do we have to check whether it can be found?
+						}
 						break;
 					default:
 						print_msg(WARNING_MSG, std::ostringstream().flush() << "*** WARNING: unimplemented extension type " << itEN->second.first << " in block " << index );
@@ -1119,8 +2048,12 @@ bool ExternalSequence::decodeBlock(SeqBlock *block)
 		}
 		else
 		{
-			// compatibility mode with the older pulseq versions
-			fDwellTime_us=1.0; // old Pulseq's predefined RF raster time
+			if (version_combined >= 1004000)
+				// use defined default RF raster time
+                fDwellTime_us = m_dRadiofrequencyRasterTime_us;
+            else
+				// compatibility mode with the older pulseq versions
+				fDwellTime_us=1.0; // old Pulseq's predefined RF raster time
 		}
 		//
 		block->rfAmplitude = std::vector<float>(waveform);
@@ -1129,35 +2062,8 @@ bool ExternalSequence::decodeBlock(SeqBlock *block)
 	}
 
 	// Decode gradients
-	for (int iC=GX; iC<ADC; iC++)
-	{
-		if (block->isArbitraryGradient(iC-GX))	// is arbitrary gradient?
-		{
-			// Decompress the arbitrary shape for this channel
-			CompressedShape& shape = m_shapeLibrary[block->grad[iC-GX].waveShape];
-
-			print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "Loaded shape with "
-				<< shape.samples.size() << " compressed samples" );
-
-			waveform.resize(shape.numUncompressedSamples);
-			if (!decompressShape(shape,&waveform[0]))
-				return false;
-
-			print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "Shape uncompressed to "
-				<< shape.numUncompressedSamples << " samples" );
-
-			if (fabs(m_dGradientRasterTime_us-10)>1e-3)
-			{
-				print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "Shape is on a raster that is different from the system raster, exitting... (will try resampling in the future versions...)" );
-				// TODO: !!!
-				// PROBLEM: we need 'first' and 'last' to be able to interpolate correctly...
-				return false;
-			}
-
-			block->gradWaveforms[iC-GX] = std::vector<float>(waveform);
-		}
-	}
-
+    if (!decodeArbGradInBlock(block))
+        return false;
 	if (!decodeExtTrapGradInBlock(block))
 		return false;
 
@@ -1179,12 +2085,72 @@ bool ExternalSequence::decodeBlock(SeqBlock *block)
 	return true;
 }
 
+bool ExternalSequence::decodeArbGradInBlock(SeqBlock *block)
+{
+	int *events = &block->events[0];
+	print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "Decoding arbitrary gradients in block " << block->index << " events: "
+		<< events[0]+1 << " " << events[1]+1 << " " << events[2]+1 << " " << events[3]+1 << " " << events[4]+1 );
+    std::vector<float> waveform;
+    for (int iC = GX; iC < ADC; iC++)
+	{
+		if (block->isArbitraryGradient(iC-GX))	// is arbitrary gradient?
+		{
+			// Decompress the arbitrary shape for this channel
+			CompressedShape& shape = m_shapeLibrary[block->grad[iC-GX].waveShape];
+
+			print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "Loaded shape with " << shape.samples.size() << " compressed samples" );
+
+			waveform.resize(shape.numUncompressedSamples);
+			if (!decompressShape(shape,&waveform[0]))
+				return false;
+
+			print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "Shape uncompressed to " << shape.numUncompressedSamples << " samples" );
+
+			if (fabs(m_dGradientRasterTime_us-10)>1e-3)
+			{
+				print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "Shape is on a raster that is different from the system raster, exitting... (will try resampling in the future versions...)" );
+				// TODO: !!!
+				// PROBLEM: we need 'first' and 'last' to be able to interpolate correctly...
+				return false;
+			}
+
+			if (block->isArbGradWithOversampling(iC - GX) && m_ArbGradSamplingMode != ags_preserve_oversampling) // oversampling?
+			{
+                if (m_ArbGradSamplingMode == ags_center)
+					block->gradWaveforms[iC-GX] = std::vector<float>((waveform.size()+1)/2);
+                else // for now assuming (m_ArbGradSamplingMode == ags_edge)
+                    block->gradWaveforms[iC - GX] = std::vector<float>((waveform.size()-1) / 2); // the number of the available edge samples is always 1 smaller than the center samples
+
+				std::vector<float>::iterator it_os=waveform.begin();
+				for (std::vector<float>::iterator it=block->gradWaveforms[iC-GX].begin(); it !=block->gradWaveforms[iC-GX].end(); ++it){
+                    if (m_ArbGradSamplingMode == ags_center)
+					{
+						*it = *it_os;
+						// std::advance(it_os,2); // this doen't work because of the odd number of elements 
+						++it_os;
+					}
+					else // for now assuming (m_ArbGradSamplingMode == ags_edge)
+					{
+						++it_os;
+						*it = *it_os;
+					}
+
+					if (it_os != waveform.end())
+						++it_os;
+				}
+			}
+			else
+				block->gradWaveforms[iC-GX] = std::vector<float>(waveform);
+		}
+	}
+    return true;
+}
+
 bool ExternalSequence::decodeExtTrapGradInBlock(SeqBlock *block)
 {
 	int *events = &block->events[0];
 	print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "Decoding ext gradient in block " << block->index << " events: "
-		<< events[0]+1 << " " << events[1]+1 << " " << events[2]+1 << " "
-		<< events[3]+1 << " " << events[4]+1 );
+		<< events[0]+1 << " " << events[1]+1 << " " << events[2]+1 << " " << events[3]+1 << " " << events[4]+1 );
 
 	std::vector<float> waveform;
 	block->gradExtTrapForms.clear();
@@ -1320,7 +2286,7 @@ void ExternalSequence::checkRF(SeqBlock& block)
 
 
 /***********************************************************/
-int ExternalSequence::getline(std::istream& is, char *buffer, int MAX_SIZE)
+int ExternalSequence::getline(std::istream& is, char *buffer, int MAX_SIZE, bool bRaw)
 {
 	//std::cout << "ExternalSequence::getline()" << std::endl;
 
@@ -1328,20 +2294,25 @@ int ExternalSequence::getline(std::istream& is, char *buffer, int MAX_SIZE)
 	for(;;) {
 		char c = (char)is.get();
 
-		switch (c) {
-			case '\n':
-				buffer[i]='\0';
-				//std::cout << "ExternalSequence::getline() EOL i:" << i << std::endl;
-				//std::cout << "buffer: " << buffer << std::endl;
-				return gl_true;
-			case '\r':
-				if(is.peek() == '\n') {
-					is.get();       // Discard character
-				}
-				buffer[i]='\0';
-				//std::cout << "ExternalSequence::getline() CR i:" << i << std::endl;
-				//std::cout << "buffer: " << buffer << std::endl;
-				return gl_true;
+		if (!bRaw) {
+            switch (c) {
+                case '\n':
+                    buffer[i] = '\0';
+                    // std::cout << "ExternalSequence::getline() EOL i:" << i << std::endl;
+                    // std::cout << "buffer: " << buffer << std::endl;
+                    return gl_true;
+                case '\r':
+                    if (is.peek() == '\n')
+                    {
+                        is.get(); // Discard character
+                    }
+                    buffer[i] = '\0';
+                    // std::cout << "ExternalSequence::getline() CR i:" << i << std::endl;
+                    // std::cout << "buffer: " << buffer << std::endl;
+                    return gl_true;
+            }
+		}
+        switch (c) {
 			case EOF:
 				if(i==0)
 					is.seekg(-1);   // Create error on stream
@@ -1350,11 +2321,16 @@ int ExternalSequence::getline(std::istream& is, char *buffer, int MAX_SIZE)
 				return (i!=0)?gl_true:gl_false;
 			default:
 				buffer[i++] = c;
-				if (i>=MAX_SIZE-1) // -1 because we have to reserve one place for the \0 symbol
+				if (i>=MAX_SIZE-1 || // -1 because we have to reserve one place for the \0 symbol
+					c=='\n' )        // we are in the *raw* mode
 				{
 					buffer[i]='\0';
-					return gl_truncated;
+                    if (c == '\n')
+                        return gl_true;
+                    else
+						return gl_truncated;
 				}
+				
 		}
 	}
 }
@@ -1366,6 +2342,9 @@ int ExternalSequence::getline(std::istream& is, char *buffer, int MAX_SIZE)
 #define LABELMAP_FLAG(LBL) \
 	m_labelMap.mapFlagIdToStr[LBL]=#LBL;\
 	m_labelMap.mapStrToLabel[#LBL]=std::make_pair(LABEL_UNKNOWN,LBL);
+
+#define LABELMAP_IGNORE(LBL)               \
+    m_labelMap.mapStrToLabel[#LBL]  = std::make_pair(LABEL_UNKNOWN, FLAG_UNKNOWN);
 
 int ExternalSequence::decodeLabel(ExtType exttype, int& nVal, char* szLabelID, LabelEvent& label)
 {
@@ -1388,18 +2367,17 @@ int ExternalSequence::decodeLabel(ExtType exttype, int& nVal, char* szLabelID, L
 		LABELMAP_FLAG(SMS);
 		LABELMAP_FLAG(REF);
 		LABELMAP_FLAG(IMA);
+		LABELMAP_FLAG(OFF);
 		LABELMAP_FLAG(NOISE);
-		LABELMAP_FLAG(PMC);
 		LABELMAP_FLAG(NOPOS);
 		LABELMAP_FLAG(NOROT);
 		LABELMAP_FLAG(NOSCL);
+        LABELMAP_IGNORE(PMC); // "actively" ignore these labels (e.g. without warnings)
+        LABELMAP_IGNORE(TRID);
 		// check if all labels/flags have been added to the map
-		//print_msg(WARNING_MSG, std::ostringstream().flush() << "*** m_labelMap.mapLabelIdToStr.size()= " << m_labelMap.mapLabelIdToStr.size());
-		//print_msg(WARNING_MSG, std::ostringstream().flush() << "*** m_labelMap.mapFlagIdToStr.size()= " << m_labelMap.mapFlagIdToStr.size());
-		//print_msg(WARNING_MSG, std::ostringstream().flush() << "*** m_labelMap.mapStrToLabel.size()= " << m_labelMap.mapStrToLabel.size());
 		assert(m_labelMap.mapLabelIdToStr.size()==NUM_LABELS);
 		assert(m_labelMap.mapFlagIdToStr.size()==NUM_FLAGS);
-		assert(m_labelMap.mapStrToLabel.size()==NUM_LABELS+NUM_FLAGS);
+		assert(m_labelMap.mapStrToLabel.size()>=NUM_LABELS+NUM_FLAGS); // LABELMAP_IGNORE makes this map longer
 	}
 
 	// now search
@@ -1408,11 +2386,17 @@ int ExternalSequence::decodeLabel(ExtType exttype, int& nVal, char* szLabelID, L
 	{
 		//label.defined=false; // when no label is founded, reset label.defined to false
 		print_msg(WARNING_MSG, std::ostringstream().flush() << "*** WARNING: unknown label specification\n");
-		return 1;
+        return dl_unknown;
 	}
 
 	int nKnownLBL=it->second.first;
 	int nKnownFG=it->second.second;
+
+	if (nKnownLBL == LABEL_UNKNOWN && nKnownFG == FLAG_UNKNOWN)
+    {
+		// "actively" ignored label -- return a corresponding value without a warning
+        return dl_ignored;
+    }
 	
 	//assemble LabelEvent
 	if (nKnownFG !=FLAG_UNKNOWN){
@@ -1423,40 +2407,49 @@ int ExternalSequence::decodeLabel(ExtType exttype, int& nVal, char* szLabelID, L
 		label.numVal=std::make_pair(nKnownLBL,nVal);
 	}
 
-	//here we check if the labels/flags are valid //No boundary check, boundary check moves to prep()
+	//here we check if the labels/flags are valid //No boundary check, boundary check has been moved to prep()
 	if (exttype==EXT_LABELSET){				//here we check if the values are valid
 		if (nKnownLBL!=LABEL_UNKNOWN){
-			/*if (nVal<0){
-				print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Extension specification LABELSET for int-type MDH Headers is incorrect\n");
-				return -1;
-			}else*/
-				return 0;
+            return dl_ok;
 		}else if (nKnownFG!=FLAG_UNKNOWN){
 			if ((nVal!=0)&&(nVal!=1)){
-				print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Extension specification LABELSET for bool-type MDH Headers is incorrect\n");
-				return -1;
+				print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Extension specification LABELSET for bool-type labls is incorrect\n");
+                return dl_error;
 			}else
-				return 0;
+                return dl_ok;
 		}else{
 			print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: EXT_LABELSET only support LABEL&&FLAG\n");
-			return -1;					 
+            return dl_ok; // this should never happen					 
 		}
 	}else if (exttype==EXT_LABELINC){
 		if (nKnownLBL!=LABEL_UNKNOWN){			
-			return 0;				 
+			return dl_ok;				 
 		}else if (nKnownFG!=FLAG_UNKNOWN){				// EXT_LABELINC should NOT be used for bool type MDH Headers
-			print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Extension specification LABELINC is NOT for bool-type MDH Headers\n");
-			return -1;
+			print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Extension specification LABELINC is NOT compatible with bool-type labels\n");
+            return dl_error;
 		}else {
 			print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: EXT_LABELINC only support LABEL&&FLAG\n");
-			return -1;	
+            return dl_error; // this should never happen	
 		}		
 	}else{											// No ExtType recognized
-		print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Extension specification is NOT recognized\n");
-		return -1;					 
+        print_msg(ERROR_MSG, std::ostringstream().flush() << "*** ERROR: Extension specification " << exttype << " is NOT recognized\n");
+        return dl_error;					 
 	}
 }
 
+std::string ExternalSequence::getCounterIdAsString(int nID) {
+	std::map<int,std::string>::iterator it = m_labelMap.mapLabelIdToStr.find(nID);
+	if (it==m_labelMap.mapLabelIdToStr.end())
+		return "";
+	return it->second;
+}
+
+std::string ExternalSequence::getFlagIdAsString(int nID) {
+	std::map<int,std::string>::iterator it = m_labelMap.mapFlagIdToStr.find(nID);
+	if (it==m_labelMap.mapFlagIdToStr.end())
+		return "";
+	return it->second;
+}
 bool ExternalSequence::isGradientInBlockStartAtNonZero(SeqBlock *block, int channel) {
 	if (!block->isExtTrapGradient(channel) && !block->isArbitraryGradient(channel)) {
 		//ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "isGradientInBlockStartAtNonZero() returns FALSE because there is no arb grad in channel " << channel);
@@ -1467,6 +2460,12 @@ bool ExternalSequence::isGradientInBlockStartAtNonZero(SeqBlock *block, int chan
 		//ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "isGradientInBlockStartAtNonZero() returns FALSE because there is delay in channel " << channel);
 		return false;
 	}
+	// new since v1.5.0 : first/last
+    if (version_combined >= 1005000 && block->grad[channel].first!=FLOAT_UNDEFINED )
+    {
+		return fabs(block->grad[channel].first)>0;
+	}
+	// older formats
 	if (!block->gradWaveforms[channel].empty()) { 
 		//ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "isGradientInBlockStartAtNonZero() uses decompressed shape and returns " << (fabs(block->gradWaveforms[channel].front())>0));
 		return fabs(block->gradWaveforms[channel].front())>0;
@@ -1502,3 +2501,844 @@ std::string& str_trim(std::string& str)
     return str_ltrim(str_rtrim(str));
 }
 
+std::string str_tolower(std::string str)
+{
+	for (std::string::iterator it=str.begin(); it!=str.end(); ++it)
+		if ((*it)<='Z' && (*it)>='A')
+			*it += 'a'-'A';
+    return str;
+}
+
+
+void LabelStateAndBookkeeping::initBookkeeping()
+{
+    m_bAdcLabelsInUse=false;
+    m_bNonAdcLabelsInUse=false;
+    initBookkeepingADC();
+    m_currLabelValueStorage.flag.bValUsed.assign(NUM_FLAGS, false);
+    m_currLabelValueStorage.num.bValUsed.assign(NUM_LABELS, false);
+}
+
+void LabelStateAndBookkeeping::initBookkeepingADC()
+{
+    // TRACE_PUT0(TC_INFO,TF_SEQ,">>> PULSEQ-DEBUG: initializing the MinMaxLabelStorage...");
+    m_MinMaxLabelBookkeepingADC.flagValMin.assign(NUM_FLAGS, false);
+    m_MinMaxLabelBookkeepingADC.flagValMax.assign(NUM_FLAGS, false);
+    m_MinMaxLabelBookkeepingADC.bFlagMinMaxValid.assign(NUM_FLAGS, false);
+    m_MinMaxLabelBookkeepingADC.numValMin.assign(NUM_LABELS, 0);
+    m_MinMaxLabelBookkeepingADC.numValMax.assign(NUM_LABELS, 0);
+    m_MinMaxLabelBookkeepingADC.bNumMinMaxValid.assign(NUM_LABELS, false);
+    // parallel imaging flags
+    m_MinMaxLabelBookkeepingADC.minRefLin    = -1;
+    m_MinMaxLabelBookkeepingADC.numRefLin    = 0;
+    m_MinMaxLabelBookkeepingADC.numRefImaLin = 0;
+    m_MinMaxLabelBookkeepingADC.minRefPar    = -1;
+    m_MinMaxLabelBookkeepingADC.numRefPar    = 0;
+    m_MinMaxLabelBookkeepingADC.numRefImaPar = 0;
+	// first/last
+    m_mapFirstInSlc.clear();
+    m_mapLastInSlc.clear();
+    m_lastInMeas.clear();
+    m_setFirstInSlc.clear();
+    m_setLastInSlc.clear();
+}
+
+void LabelStateAndBookkeeping::initCurrState()
+{
+    m_currLabelValueStorage.flag.val.assign(NUM_FLAGS, false);
+    m_currLabelValueStorage.flag.bValUpdated.assign(NUM_FLAGS, false);
+    //m_currLabelValueStorage.flag.bValUsed.assign(NUM_FLAGS, false);
+    m_currLabelValueStorage.num.val.assign(NUM_LABELS, 0);
+    m_currLabelValueStorage.num.bValUpdated.assign(NUM_LABELS, false);
+    //m_currLabelValueStorage.num.bValUsed.assign(NUM_LABELS, false);
+}
+
+// * ------------------------------------------------------------------ *
+// *                                                                    *
+// * Name        :  UpdateDataLabelStorage
+// *
+// * Description :  Update the current/maximum global DataLabelStorage
+// *
+// * Return      :  bool
+// *
+// * ------------------------------------------------------------------ *
+void LabelStateAndBookkeeping::updateLabelValues(SeqBlock* pBlock)
+{
+    // update m_currLabelValueStorage according to labelinc/labelset from the block
+    // for each block, we first check labelset then labelinc, which means labelinc will affect labelset, not the other
+    // way around.
+    static const char*      ptModule     = {"ARBITRARY_SBB::updateLabelValueStorage"};
+    std::vector<LabelEvent> Tmp_labelset = pBlock->GetLabelSetEvents();
+    int                     id;
+    m_currLabelValueStorage.flag.bValUpdated.assign(NUM_FLAGS, false);
+    m_currLabelValueStorage.num.bValUpdated.assign(NUM_LABELS, false);
+    for (id = 0; id < Tmp_labelset.size(); ++id)
+    {
+        // if (Tmp_labelset[id].defined){
+        if (Tmp_labelset[id].numVal.first != LABEL_UNKNOWN)
+        {
+            m_currLabelValueStorage.num.val[Tmp_labelset[id].numVal.first] = Tmp_labelset[id].numVal.second;
+            if (Tmp_labelset[id].numVal.second)
+                m_currLabelValueStorage.num.bValUsed[Tmp_labelset[id].numVal.first]= true; // only mark as used if non-zero
+            m_currLabelValueStorage.num.bValUpdated[Tmp_labelset[id].numVal.first] = true;
+            if (Tmp_labelset[id].numVal.first <= LAST_ADC_RELEVANT_LABEL) // QC: LAST_ADC_RELEVANT_LABEL is REP. 2025.06.30
+                m_bAdcLabelsInUse = true;
+            else
+                m_bNonAdcLabelsInUse = true;
+        }
+        if (Tmp_labelset[id].flagVal.first != FLAG_UNKNOWN)
+        {
+            m_currLabelValueStorage.flag.val[Tmp_labelset[id].flagVal.first] = Tmp_labelset[id].flagVal.second;
+            if (Tmp_labelset[id].flagVal.second)
+                m_currLabelValueStorage.flag.bValUsed[Tmp_labelset[id].flagVal.first]
+                    = true; // only mark as used if non-zero
+            m_currLabelValueStorage.flag.bValUpdated[Tmp_labelset[id].flagVal.first] = true;
+            if (Tmp_labelset[id].numVal.first <= LAST_ADC_RELEVANT_FLAG)
+                m_bAdcLabelsInUse = true;
+            else
+                m_bNonAdcLabelsInUse = true;
+        }
+    }
+    std::vector<LabelEvent> Tmp_labelinc = pBlock->GetLabelIncEvents();
+    for (id = 0; id < Tmp_labelinc.size(); ++id)
+    {
+        if (Tmp_labelinc[id].numVal.first != LABEL_UNKNOWN)
+        {
+            m_currLabelValueStorage.num.val[Tmp_labelinc[id].numVal.first] += Tmp_labelinc[id].numVal.second;
+            m_currLabelValueStorage.num.bValUsed[Tmp_labelinc[id].numVal.first]
+                = true; // always mark as used because it is always non-zero
+            m_currLabelValueStorage.num.bValUpdated[Tmp_labelinc[id].numVal.first] = true;
+        }
+        if (Tmp_labelinc[id].numVal.first <= LAST_ADC_RELEVANT_LABEL)
+            m_bAdcLabelsInUse = true;
+        else
+            m_bNonAdcLabelsInUse = true;
+    }
+}
+
+bool LabelStateAndBookkeeping::checkLabelValuesADC()
+{
+    if (m_currLabelValueStorage.flag.val[NOISE] || m_currLabelValueStorage.flag.val[NAV] || m_currLabelValueStorage.flag.val[REF]) // noise scans and navigator scans and ref scans are not included in first/last/min/max and therefore cannot be checked
+		return true;
+
+    // label boundary check
+    int id;
+    for (id = 0; id < m_currLabelValueStorage.num.val.size(); ++id)
+    {
+        if (m_MinMaxLabelBookkeepingADC.bNumMinMaxValid[id])
+        {
+            if ((m_currLabelValueStorage.num.val[id] > m_MinMaxLabelBookkeepingADC.numValMax[id])
+                || (m_currLabelValueStorage.num.val[id] < m_MinMaxLabelBookkeepingADC.numValMin[id]))
+            {
+                ExternalSequence::print_msg(
+                    NORMAL_MSG,
+                    std::ostringstream().flush()
+                        << "ERROR: Current data label (counter) " << id << " with value "
+                        << m_currLabelValueStorage.num.val[id] << " is either below the min boundary "
+                        << m_MinMaxLabelBookkeepingADC.numValMin[id] << " or above the max boundary "
+                        << m_MinMaxLabelBookkeepingADC.numValMax[id]);
+                dump_internal(m_currLabelValueStorage.num.val, m_currLabelValueStorage.flag.val, "current: ");
+                dump_internal(m_MinMaxLabelBookkeepingADC.numValMin, m_MinMaxLabelBookkeepingADC.flagValMin, "min: ");
+                dump_internal(m_MinMaxLabelBookkeepingADC.numValMax, m_MinMaxLabelBookkeepingADC.flagValMax, "max: ");
+                return false;
+            }
+        }
+    }
+    for (id = 0; id < m_currLabelValueStorage.flag.val.size(); ++id)
+    {
+        if (m_MinMaxLabelBookkeepingADC.bFlagMinMaxValid[id])
+        {
+            if (m_currLabelValueStorage.flag.val[id] < m_MinMaxLabelBookkeepingADC.flagValMin[id]
+                || m_currLabelValueStorage.flag.val[id] > m_MinMaxLabelBookkeepingADC.flagValMax[id])
+            {
+                ExternalSequence::print_msg(
+                    NORMAL_MSG,
+                    std::ostringstream().flush()
+                            << "ERROR: Current data label (flag) " << id << " with value " << m_currLabelValueStorage.flag.val[id]
+                            << " is either below the min boundary "
+							<< m_MinMaxLabelBookkeepingADC.flagValMin[id] << " or above the max boundary " << m_MinMaxLabelBookkeepingADC.flagValMax[id]);
+                dump_internal(m_currLabelValueStorage.num.val, m_currLabelValueStorage.flag.val, "current: ");
+                dump_internal(m_MinMaxLabelBookkeepingADC.numValMin, m_MinMaxLabelBookkeepingADC.flagValMin, "min: ");
+                dump_internal(m_MinMaxLabelBookkeepingADC.numValMax, m_MinMaxLabelBookkeepingADC.flagValMax, "max: ");
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// some older compilers (or environments) do not know vec.cbegin()...
+// ve12u has GCC version 5.3, but still no cbegin() and cend(), so checking for versions doenät bring us there, therefor an uglz combo at the end...
+#if defined(VXWORKS) || (defined(_MSC_VER) && _MSC_VER<=1600) || (defined(__GNUC__) && (__GNUC__<4 || (__GNUC__==4 && __GNUC_MINOR__<=6))) || !defined(COMPAT_nX)
+#define cbegin begin
+#define cend end 
+#endif //VXWORKS //_MSC_VER //__GNUC__
+
+std::string vec2str(const std::vector<int>& vec) 
+{
+	std::ostringstream os;
+	for (std::vector<int>::const_iterator it = vec.cbegin(); it != vec.cend(); ++it) {
+		os << *it;
+		if (it + 1 != vec.cend()) os << ' ';
+	}
+	return os.str();
+}
+
+void LabelStateAndBookkeeping::updateBookkeepingRecordsADC() // QC: this function is executed for every ADC in a for-loop nin Arbitrary.cpp, and track necessary information. 2025.06.30
+{
+    // label boundary evaluation
+    // data flags for LastLine/LastSlice/LastPar, etc are analyzed further below
+    if (!m_currLabelValueStorage.flag.val[NOISE] && !m_currLabelValueStorage.flag.val[NAV] && !m_currLabelValueStorage.flag.val[REF]) // noise scans and navigator scans and reference scans are not included in first/last/min/max QC: FIRSTSCANINSLICE==false for navigator scans. 2025.01.31
+    {
+		int id;
+		// flags
+		for (id = 0; id < m_currLabelValueStorage.flag.val.size(); ++id)
+		{
+			/*if (m_currLabelValueStorage.bFlagUsed[id])*/ {
+				if (m_MinMaxLabelBookkeepingADC.bFlagMinMaxValid[id]) // QC: if the min & max for the current flag is already set, then check and update the min and max. 2025.01.31
+				{
+					if (m_MinMaxLabelBookkeepingADC.flagValMin[id] > m_currLabelValueStorage.flag.val[id])
+						m_MinMaxLabelBookkeepingADC.flagValMin[id] = m_currLabelValueStorage.flag.val[id];
+					if (m_MinMaxLabelBookkeepingADC.flagValMax[id] < m_currLabelValueStorage.flag.val[id])
+						m_MinMaxLabelBookkeepingADC.flagValMax[id] = m_currLabelValueStorage.flag.val[id];
+				}
+				else // QC: otherwise, set the min & max to the current value and set the flag up. 2025.01.31
+				{
+					ExternalSequence::print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "initializing bookkeeping for flag " << id << " with " << m_currLabelValueStorage.flag.val[id]);
+					m_MinMaxLabelBookkeepingADC.flagValMin[id]       = m_currLabelValueStorage.flag.val[id];
+					m_MinMaxLabelBookkeepingADC.flagValMax[id]       = m_currLabelValueStorage.flag.val[id];
+					m_MinMaxLabelBookkeepingADC.bFlagMinMaxValid[id] = true;
+				}
+			}
+		}
+		// numeric values
+		for (id = 0; id < m_currLabelValueStorage.num.val.size(); ++id)
+		{
+			/*if (m_currLabelValueStorage.bNumValUsed[id])*/ {
+				if (m_MinMaxLabelBookkeepingADC.bNumMinMaxValid[id])
+				{
+					if (m_MinMaxLabelBookkeepingADC.numValMin[id] > m_currLabelValueStorage.num.val[id])
+						m_MinMaxLabelBookkeepingADC.numValMin[id] = m_currLabelValueStorage.num.val[id];
+					if (m_MinMaxLabelBookkeepingADC.numValMax[id] < m_currLabelValueStorage.num.val[id])
+						m_MinMaxLabelBookkeepingADC.numValMax[id] = m_currLabelValueStorage.num.val[id];
+				}
+				else
+				{
+					ExternalSequence::print_msg(DEBUG_LOW_LEVEL, std::ostringstream().flush() << "initializing bookkeeping for counter " << id << " with " << m_currLabelValueStorage.num.val[id]);
+					m_MinMaxLabelBookkeepingADC.numValMin[id]       = m_currLabelValueStorage.num.val[id];
+					m_MinMaxLabelBookkeepingADC.numValMax[id]       = m_currLabelValueStorage.num.val[id];
+					m_MinMaxLabelBookkeepingADC.bNumMinMaxValid[id] = true;
+				}
+			}
+		}
+		// counter & flags tracking for parallel imaging
+		// QC: always correct by using bookkeeping? e.g. in unregular or random samping case. 2024.12.20
+		if (m_currLabelValueStorage.flag.bValUsed[REF])
+		{
+			if (m_currLabelValueStorage.flag.val[REF])
+			{
+				if (m_MinMaxLabelBookkeepingADC.minRefLin < 0
+					|| m_MinMaxLabelBookkeepingADC.minRefLin > m_currLabelValueStorage.num.val[LIN])
+				{
+					m_MinMaxLabelBookkeepingADC.minRefLin = m_currLabelValueStorage.num.val[LIN];
+					// reset counters because we only want to count once (e.g. for minPar and minLin)
+					m_MinMaxLabelBookkeepingADC.numRefLin    = 0;
+					m_MinMaxLabelBookkeepingADC.numRefImaLin = 0;
+					m_MinMaxLabelBookkeepingADC.numRefPar    = 0;
+					m_MinMaxLabelBookkeepingADC.numRefImaPar = 0;
+				}
+				if (m_MinMaxLabelBookkeepingADC.minRefPar < 0
+					|| m_MinMaxLabelBookkeepingADC.minRefPar > m_currLabelValueStorage.num.val[PAR])
+				{
+					m_MinMaxLabelBookkeepingADC.minRefPar = m_currLabelValueStorage.num.val[PAR];
+					// reset counters because we only want to count once (e.g. for minPar and minLin)
+					m_MinMaxLabelBookkeepingADC.numRefLin    = 0;
+					m_MinMaxLabelBookkeepingADC.numRefImaLin = 0;
+					m_MinMaxLabelBookkeepingADC.numRefPar    = 0;
+					m_MinMaxLabelBookkeepingADC.numRefImaPar = 0;
+				}
+				// this is a tricky part: which labels do we require to be 0 for the bookkeeping?
+				// SEG and AVG can be non-zero
+				if (m_currLabelValueStorage.num.val[SLC] == 0 && m_currLabelValueStorage.num.val[REP] == 0
+					&& m_currLabelValueStorage.num.val[AVG] == 0 && m_currLabelValueStorage.num.val[ECO] == 0
+					&& m_currLabelValueStorage.num.val[PHS] == 0 && m_currLabelValueStorage.num.val[SET] == 0)
+				{
+					if (m_MinMaxLabelBookkeepingADC.minRefLin == m_currLabelValueStorage.num.val[LIN])
+					{
+						++m_MinMaxLabelBookkeepingADC.numRefPar;
+						if (m_currLabelValueStorage.flag.val[IMA])
+							++m_MinMaxLabelBookkeepingADC.numRefImaPar;
+					}
+					if (m_MinMaxLabelBookkeepingADC.minRefPar == m_currLabelValueStorage.num.val[PAR])
+					{
+						++m_MinMaxLabelBookkeepingADC.numRefLin;
+						if (m_currLabelValueStorage.flag.val[IMA])
+							++m_MinMaxLabelBookkeepingADC.numRefImaLin;
+					}
+				}
+			}
+		}
+		// track first/last scan in slice, etc
+        int nCurSlc = m_currLabelValueStorage.num.val[SLC]; // QC: current slice index
+		// last tracking is easy: we just use the current as the last candidate and the finalize call will make it right
+		m_lastInMeas = m_currLabelValueStorage.getAdcCounters(false,false); // QC: m_lastInMeas keeps updated and record the last scan in measurement. 2025.06.30
+		//ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "updating m_lastInMeas to " << vec2str(m_lastInMeas));
+        m_mapLastInSlc[nCurSlc] = m_currLabelValueStorage.getAdcCounters(true, false); // fixing the lastInSlice behaviour for REP!=0. // QC: vector of first ADC-relevant labels (exclude REP) for slice nCurSlc. The m_mapLastInSlc[nCurSlc] keep updated until reaching the last scan for nCurSlc. 2025.06.30
+		// first tracking: only update if this slice has no record
+        if (m_mapFirstInSlc.find(nCurSlc) == m_mapFirstInSlc.end()) //QC: if the first scan of slice nCurSlc is not found (i.e. == m_mapFirstInSlc.end()), then store the current ADC label vectors as first scan. 2025.06.30 
+        {
+            m_mapFirstInSlc[nCurSlc] = m_mapLastInSlc[nCurSlc]; // m_mapLastInSlc[nCurSlc] actually contains the current counters, see above
+        }
+    }
+}
+
+std::vector<int> LabelValueStorage::getAdcCounters(bool bIgnoreREP, bool bAlsoIgnoreAVG)
+{
+	//ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "LabelValueStorage::getAdcCounters() called for " << vec2str(num.val));
+    if (bAlsoIgnoreAVG && !bIgnoreREP)
+    {
+        ExternalSequence::print_msg(WARNING_MSG, std::ostringstream().flush() << "WARNING: LabelValueStorage::getAdcCounters() was called with bAlsoIgnoreAVG, fixing bIgnoreREP");
+        bIgnoreREP = bAlsoIgnoreAVG;
+	}
+    std::vector<int> r(num.val.begin(), num.val.begin() + LAST_ADC_RELEVANT_LABEL + 1 - int(bIgnoreREP) - int(bAlsoIgnoreAVG)); // QC: get the index of all LABELS (with or without REP and AVG). r is a range constructor. 2025.06.30
+    //ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "returning " << vec2str(r));
+	return r;
+}
+
+
+void LabelStateAndBookkeeping::finalizeBookkeepingRecordsADC()
+{
+	ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "Entering LabelStateAndBookkeeping::finalizeBookkeepingRecordsADC()...");
+	std::map<int, std::vector<int> >::iterator it;
+    for (it = m_mapFirstInSlc.begin(); it != m_mapFirstInSlc.end(); ++it)
+    {
+		ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "Adding " << vec2str(it->second) << " as FirstInSlc");
+        m_setFirstInSlc.insert(it->second);
+    }
+    for (it = m_mapLastInSlc.begin(); it != m_mapLastInSlc.end(); ++it)
+    {
+		ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "Adding " << vec2str(it->second) << " as LastInSlc");
+		m_setLastInSlc.insert(it->second);
+    }
+}
+
+bool LabelStateAndBookkeeping::isFirstScanInSlice() 
+{
+	if (m_setFirstInSlc.empty() && !m_mapFirstInSlc.empty())
+		finalizeBookkeepingRecordsADC();
+	return m_setFirstInSlc.end() != m_setFirstInSlc.find(m_currLabelValueStorage.getAdcCounters(true,false));
+}
+
+bool LabelStateAndBookkeeping::isLastScanInSlice() 
+{
+	if (m_setLastInSlc.empty() && !m_mapLastInSlc.empty())
+		finalizeBookkeepingRecordsADC();
+	return m_setLastInSlc.end() != m_setLastInSlc.find(m_currLabelValueStorage.getAdcCounters(true,false));
+}
+
+
+void LabelStateAndBookkeeping::dump(const char* szMsg /*=NULL*/, bool bMinMax /*=true*/, bool bCurr /*=true*/)
+{
+    if (bMinMax)
+    {
+        ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "Min Values:");
+        dump_internal(m_MinMaxLabelBookkeepingADC.numValMin, m_MinMaxLabelBookkeepingADC.flagValMin, szMsg);
+        ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "Max Values:");
+        dump_internal(m_MinMaxLabelBookkeepingADC.numValMax, m_MinMaxLabelBookkeepingADC.flagValMax, szMsg);
+    }
+    if (bCurr)
+    {
+        ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "Current Values:");
+        dump_internal(m_currLabelValueStorage.num.val, m_currLabelValueStorage.flag.val, szMsg);
+    }
+}
+
+void LabelStateAndBookkeeping::dump_internal(const std::vector<int>& numVal, const std::vector<bool>& flagVal, const char* szMsg)
+{
+    const char* szSpe = ""; 
+	char* szSpe0=NULL;
+    if (szMsg == NULL)
+        szMsg ="";
+    else
+    {
+        int nLen = strlen(szMsg);
+        szSpe0  = new (char[nLen + 1]);
+        memset(szSpe0, ' ', nLen);
+        szSpe0[nLen] = '\0';
+        szSpe = szSpe0;
+    }
+    ExternalSequence::print_msg(
+        NORMAL_MSG,
+        std::ostringstream().flush() << szMsg << " SLC " << numVal[SLC] << " SEG " << numVal[SEG] << " REP "
+                                     << numVal[REP]);
+    ExternalSequence::print_msg(
+        NORMAL_MSG,
+        std::ostringstream().flush() << szSpe << " AVG " << numVal[AVG] << " ECO " << numVal[ECO] << " PHS "
+                                     << numVal[PHS]);
+    ExternalSequence::print_msg(
+        NORMAL_MSG,
+        std::ostringstream().flush() << szSpe << " SET " << numVal[SET] << " LIN " << numVal[LIN] << " PAR "
+                                     << numVal[PAR]);
+    ExternalSequence::print_msg(
+        NORMAL_MSG, std::ostringstream().flush() << szSpe << " NAV " << flagVal[NAV] << " REV " << flagVal[REV]);
+    ExternalSequence::print_msg(
+        NORMAL_MSG, std::ostringstream().flush() << szSpe << " SMS " << flagVal[SMS] );
+    ExternalSequence::print_msg(
+        NORMAL_MSG,
+        std::ostringstream().flush() << szSpe << " REF " << flagVal[REF] << " IMA " << flagVal[IMA] << " NOISE "
+                                     << flagVal[NOISE]);
+    ExternalSequence::print_msg(
+        NORMAL_MSG,
+        std::ostringstream().flush() << szSpe << " NOPOS " << flagVal[NOPOS] << " NOROT " << flagVal[NOROT] << " NOSCL "
+                                     << flagVal[NOSCL]);
+    ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << szSpe << " ONCE " << numVal[ONCE]);
+    /*int c=0, r=0;
+    int i;
+    for (l=0;i<NUM_LABELS;++i)
+    {
+        if (c==0) {
+            ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << (r ? szSpe : szMsg) );
+        }
+        ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << " " << ... <-- we have a problem here
+    because this is a static function if (++c>3) {
+            ++r;
+            c=0;
+            <-- we have another problem here because print_msg always adds a newline...
+        }
+    }
+    if (c)
+        <-- print new line */
+    delete szSpe0;
+}
+
+// local service functions for calculating moments, etc...
+inline double sqr(double v)
+{
+    return v * v;
+}
+inline double linear_interpolation(double t1, double v1, double t2, double v2, double t)
+{
+    return ( v1*(t2 - t) + v2*(t - t1) ) / (t2 - t1);
+}
+inline double segment_integral(double v1, double v2, double t)
+{
+	// integrates a linear function defined by two points: (0,v1) and (1,v2) in the range [0, t]
+    return v1*t+0.5*(v2-v1)*sqr(t);
+}
+    // SeqBlock / gradient moment calculation functions 
+void SeqBlock::gradientsAt(double dTimeInBlock, std::vector<double>& vResult) // TODO: add optional parameter(s) to calculate at multiple time points separated by dwell time 
+{
+    vResult.resize(NUM_GRADS);
+    if (dTimeInBlock < 0.0 || dTimeInBlock > GetDuration())
+    {
+        for (int i = 0; i < NUM_GRADS; ++i) // print warning?
+            vResult[i] = 0.0;
+        ExternalSequence::print_msg(WARNING_MSG, std::ostringstream().flush() << "WARNINNG: gradientsAt() requesting gradient value before or after block boundary!");
+		return;
+    }
+		
+    for (int i = 0; i < NUM_GRADS; ++i)
+    {
+        if (isTrapGradient(i))
+        {
+			GradEvent& grad = GetGradEvent(i);
+			if (dTimeInBlock <= grad.delay || grad.amplitude == 0.0) 
+			{
+				vResult[i] = 0.0; // before the gradient start
+				//ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "gradientsAt() requesting gradient before gradient");
+				continue;
+			}        
+            if (dTimeInBlock >= grad.delay + grad.rampUpTime + grad.flatTime + grad.rampDownTime)
+            {
+                vResult[i] = 0.0; // after the gradient end
+                //ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "gradientsAt() requesting gradient after gradient");
+				continue;
+            }
+            if (dTimeInBlock < grad.delay + grad.rampUpTime)
+            {
+                // ramp-up // dTimeInBlock is > grad.delay because of the ckeck above
+                vResult[i] = linear_interpolation(grad.delay, 0.0, grad.delay + grad.rampUpTime, grad.amplitude, dTimeInBlock); 
+                //ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "gradientsAt() requesting gradient on ramp-up");
+				continue;
+            }
+            else if (dTimeInBlock <= grad.delay + grad.rampUpTime + grad.flatTime)
+            {
+                // on plato
+				vResult[i] = grad.amplitude;
+                //ExternalSequence::print_msg(NORMAL_MSG,std::ostringstream().flush() << "gradientsAt() requesting gradient on plato, vResult[" << i << "]=" << vResult[i]);
+				continue;
+            }
+            else
+            {
+				// ramp-down // because dTimeInBlock is < grad.delay + grad.rampUpTime + grad.flatTime + grad.rampDownTime (see check above)
+                vResult[i] = linear_interpolation(
+                    grad.delay + grad.rampUpTime + grad.flatTime, grad.amplitude,
+                    grad.delay + grad.rampUpTime + grad.flatTime + grad.rampDownTime, 0.0,
+                    dTimeInBlock);
+                ExternalSequence::print_msg(NORMAL_MSG, std::ostringstream().flush() << "gradientsAt() requesting gradient on ramp-down");
+				continue;
+			}            
+        }
+        else if (isExtTrapGradient(i))
+        {
+            GradEvent& grad = GetGradEvent(i);
+            if (dTimeInBlock < grad.delay || grad.amplitude == 0.0) // < and not <=
+            {
+                vResult[i] = 0.0; // before the gradient start
+                continue;
+            }
+            double                   dTimeInGrad = dTimeInBlock - grad.delay;
+			const std::vector<long>& times = GetExtTrapGradTimes(i);
+            if (dTimeInGrad > times.back())
+            {
+                vResult[i] = 0.0; // after the gradient end
+                continue;
+            }
+            // now we know dTimeInGrad is bracketed between times[0] and times.back() (possibly including both)
+            const std::vector<float>& wave = GetExtTrapGradShape(i);
+            if (times[0] == dTimeInGrad)
+            {
+                vResult[i] = wave[0] * grad.amplitude; 
+                continue;
+            }
+            if (times.back() == dTimeInGrad)
+            {
+                vResult[i] = wave.back() * grad.amplitude;
+                continue;
+            }
+			// do a binary search
+            int nUpperBoundCnt = times.size();
+            int nLowerBoundCnt = 0;
+            int j;
+            while (nUpperBoundCnt - nLowerBoundCnt > 1)
+            {
+                j = (nUpperBoundCnt + nLowerBoundCnt) / 2;
+                if (times[j] >= dTimeInGrad)
+                    nUpperBoundCnt = j;
+                else
+                    nLowerBoundCnt = j;
+            }
+            vResult[i] = linear_interpolation(times[nLowerBoundCnt], wave[nLowerBoundCnt], times[nUpperBoundCnt], wave[nUpperBoundCnt], dTimeInGrad) * grad.amplitude; 
+            continue;
+        }
+        else if (isArbitraryGradient(i))
+        {
+            GradEvent& grad = GetGradEvent(i);
+            if (dTimeInBlock < grad.delay || grad.amplitude == 0.0) // < and not <=
+            {
+                vResult[i] = 0.0; // before the gradient start
+                continue;
+            }
+            double dTimeInGrad_RU = (dTimeInBlock - grad.delay - getGradientRaster() / 2) / getGradientRaster();
+            int nLen = GetArbGradNumSamples(i);
+            if (dTimeInGrad_RU > nLen - 0.5) // this 0.5 is here because of the half-raster shift above
+            {
+                vResult[i] = 0.0; // after the gradient end
+                continue;
+            }
+            int nLowerBoundCnt = floor(dTimeInGrad_RU);
+            int nUpperBoundCnt = ceil(dTimeInGrad_RU);
+            if (nLowerBoundCnt >= nLen)
+                nLowerBoundCnt = nLen - 1;
+			//if (nUpperBoundCnt>=nLen) nUpperBoundCnt=nLen-1;
+			float* pfShape = GetArbGradShapePtr(i);
+			if (!pfShape)
+			{
+				ExternalSequence::print_msg(WARNING_MSG, std::ostringstream().flush() << "*** WARNING: SeqBlock::gradientsAt() called for non-decoded arbitrary gradient");
+				return;
+			}
+            if (nLowerBoundCnt < 0)
+            {
+				vResult[i] = linear_interpolation(0, grad.first, 0.5, pfShape[0]*grad.amplitude, dTimeInGrad_RU+0.5); 
+				continue;
+            }
+			if (nUpperBoundCnt >= nLen)
+            {
+				vResult[i] = linear_interpolation(nLowerBoundCnt+0.5, pfShape[nLen-1]*grad.amplitude, nLen, grad.last, dTimeInGrad_RU+0.5); 
+				continue;
+            }
+            if (nLowerBoundCnt == nUpperBoundCnt) 
+				vResult[i] =  pfShape[nLowerBoundCnt] * grad.amplitude;
+            else
+				vResult[i] = linear_interpolation(nLowerBoundCnt+0.5, pfShape[nLowerBoundCnt], nUpperBoundCnt+0.5, pfShape[nUpperBoundCnt], dTimeInGrad_RU+0.5) * grad.amplitude;
+			continue;
+        }
+		// no gradient in the block on the i-th axis
+        vResult[i] = 0.0;
+    }
+}
+
+void SeqBlock::gradMomentsAt(double dTimeInBlock, std::vector<double>& vResult) // TODO: add optional parameter(s) to calculate at multiple time points separated by dwell time // another optional parameter can be used for caching e.g. moment vector and a time point in a single vector
+{
+    vResult.resize(NUM_GRADS);
+    if (dTimeInBlock < 0.0)
+    {
+        for (int i = 0; i < NUM_GRADS; ++i)
+			vResult[i] = 0.0; 
+		// print warning?
+        return;
+    }
+    if (dTimeInBlock >= GetDuration())
+    {
+        totalBlockGradMoments(vResult); // print warning? for the == case no warning needed
+        return;
+    }
+
+    for (int i = 0; i < NUM_GRADS; ++i)
+    {
+        if (isTrapGradient(i))
+        {
+			GradEvent& grad = GetGradEvent(i);
+			if (dTimeInBlock <= grad.delay || grad.amplitude == 0.0) 
+			{
+				vResult[i] = 0.0; // before the gradient start or zero amplitude
+				continue;
+			} 
+			double dTimeInGrad = dTimeInBlock - grad.delay;
+            if (dTimeInGrad >= grad.rampUpTime + grad.flatTime + grad.rampDownTime)
+            {
+                vResult[i] = gradMomentOneTrap(i); // after the gradient end
+                continue;
+            }
+            if (dTimeInGrad <= grad.rampUpTime)
+            {
+                // ramp-up 
+                vResult[i] = 0.5 * grad.amplitude * sqr(dTimeInGrad) / grad.rampUpTime; //linear_ramp_integral(0.0, 0.0, grad.rampUpTime, grad.amplitude, dTimeInGrad); 
+                continue;
+            }
+            else if (dTimeInGrad <= grad.rampUpTime + grad.flatTime)
+            {
+                // on plato
+                vResult[i] = grad.amplitude * (dTimeInGrad - 0.5* grad.rampUpTime);
+                continue;
+            }
+            else
+            {
+				// ramp-down // because dTimeInGrad is < grad.rampUpTime + grad.flatTime + grad.rampDownTime (see check above)
+                vResult[i] = grad.amplitude * (dTimeInGrad - 0.5*grad.rampUpTime + (-0.5*sqr(dTimeInGrad) + dTimeInGrad*(grad.rampUpTime+grad.flatTime) - 0.5*sqr(grad.rampUpTime+grad.flatTime))/grad.rampDownTime);
+                continue;
+			}            
+        }
+        else if (isExtTrapGradient(i))
+        {
+            GradEvent& grad = GetGradEvent(i);
+            if (dTimeInBlock <= grad.delay || grad.amplitude == 0.0) // <= and not <, in contrast to getAmplitude
+            {
+                vResult[i] = 0.0; // before or at the gradient start
+                continue;
+            }
+            double dTimeInGrad = dTimeInBlock - grad.delay;
+			const std::vector<long>& times = GetExtTrapGradTimes(i);
+            if (dTimeInGrad >= times.back())
+            {
+                vResult[i] = gradMomentOneExtTrap(i); // at or after the gradient end
+                continue;
+            }
+            // now we know dTimeInGrad is bracketed between times[0] and times.back() (now excluding both)
+            const std::vector<float>& wave = GetExtTrapGradShape(i);
+            // in contrast to getAmplitude we don't need a binary search because we integrate all segments up to the current one...
+		    int nMax = times.size()-1;
+			double dM=0;
+            for (int j = 0; j < nMax; ++j)
+            {
+                if (dTimeInGrad <= times[j])
+                    break;
+                if (dTimeInGrad >= times[j+1])
+					dM+=(times[j+1]-times[j])*(wave[j+1]+wave[j]); // we will multiply it by 0.5 below
+				else 
+					dM += (dTimeInGrad - times[j]) * ((wave[j+1]-wave[j])*(dTimeInGrad - times[j])/(times[j+1]-times[j]) + 2*wave[j]); // we will multiply it by 0.5 below
+			}
+            vResult[i] = grad.amplitude * 0.5 * dM; 
+            continue;
+        }
+        else if (isArbitraryGradient(i))
+        {
+            GradEvent& grad = GetGradEvent(i);
+            if (dTimeInBlock <= grad.delay || grad.amplitude == 0.0) // <= and not < in cotrast to getAmplitude
+            {
+                vResult[i] = 0.0; // before or at the gradient start
+                continue;
+            }
+            double dTimeInGrad_RU = (dTimeInBlock - grad.delay) / getGradientRaster(); // for the integral calculaton the sum is correct at raster edges -- no 0.5 raster shift  //  - getGradientRaster() / 2
+            int nLen = GetArbGradNumSamples(i);
+            if (dTimeInGrad_RU >= nLen) // this 0.5 is here because of the half-raster shift above
+            {
+                vResult[i] = 0*gradMomentOneArbitrary(i); // after the gradient end
+                continue;
+            }
+            float* pfShape = GetArbGradShapePtr(i);
+            if (!pfShape)
+			{
+				ExternalSequence::print_msg(WARNING_MSG, std::ostringstream().flush() << "*** WARNING: SeqBlock::gradMomentsAt() called for non-decoded arbitrary gradient");
+				return;
+			}
+            if (dTimeInGrad_RU < 0.5)
+            {
+                vResult[i] = 0.5*getGradientRaster()*segment_integral(grad.first, grad.amplitude * pfShape[0], dTimeInGrad_RU*2);//grad.first*(dTimeInBlock - grad.delay) + (grad.amplitude * pfShape[0]-grad.first)*sqr(dTimeInBlock - grad.delay)*2/getGradientRaster();
+				continue;
+            }
+            if (dTimeInGrad_RU > nLen-0.5)
+            {
+				vResult[i] = gradMomentOneArbitrary(i) - 0.5*getGradientRaster()*segment_integral(grad.last, grad.amplitude * pfShape[nLen-1], (nLen-dTimeInGrad_RU)*2);//- grad.last*(grad.delay+nLen*getGradientRaster() - dTimeInBlock) - (grad.amplitude * pfShape[nLen-1]-grad.last)*sqr(grad.delay+nLen*getGradientRaster() - dTimeInBlock)/getGradientRaster(); 
+				continue;
+            }
+            int nLowerBoundCnt = floor(dTimeInGrad_RU-0.5);
+            int nUpperBoundCnt = ceil(dTimeInGrad_RU - 0.5);
+            // if (nLowerBoundCnt >= nLen)
+            //    nLowerBoundCnt = nLen - 1;
+            // if (nUpperBoundCnt>=nLen) nUpperBoundCnt=nLen-1;
+            double dM = grad.first / grad.amplitude * 0.25 + pfShape[0] * 0.25; // account for .first effect 
+			double test = 0.5 * segment_integral(grad.first / grad.amplitude, pfShape[0], 1);
+            for (int j = 1; j < nLowerBoundCnt; ++j)
+                dM += pfShape[j];            
+			if (nLowerBoundCnt>0)
+                dM += (pfShape[0] + pfShape[nLowerBoundCnt]) * 0.5;
+            if (nLowerBoundCnt == nUpperBoundCnt) 
+				vResult[i] = grad.amplitude * getGradientRaster() * dM;
+            else
+                vResult[i] = grad.amplitude * getGradientRaster() * (dM + segment_integral(pfShape[nLowerBoundCnt], pfShape[nUpperBoundCnt],dTimeInGrad_RU-0.5-nLowerBoundCnt));
+			continue;
+        }
+		// no gradient in the block on the i-th axis
+        vResult[i] = 0.0;
+    }
+}
+
+void SeqBlock::totalBlockGradMoments(std::vector<double>& vResult)
+{
+    vResult.resize(NUM_GRADS);
+    for (int i = 0; i < NUM_GRADS; ++i)
+    {
+        if (isTrapGradient(i))
+        {
+            vResult[i] = gradMomentOneTrap(i);
+            continue;
+        }
+        if (isExtTrapGradient(i))
+        {
+            vResult[i] = gradMomentOneExtTrap(i); 
+            continue;
+        }
+        if (isArbitraryGradient(i))
+        {
+            vResult[i] = gradMomentOneArbitrary(i);
+            continue;
+        }
+        // no gradient in the block on the i-th axis
+        vResult[i] = 0.0;
+    }
+}
+
+double SeqBlock::gradMomentOneTrap(int i)
+{
+    GradEvent& grad = GetGradEvent(i);
+    return grad.amplitude * (grad.flatTime + 0.5 * (grad.rampUpTime + grad.rampDownTime));
+}
+
+double SeqBlock::gradMomentOneExtTrap(int i)
+{
+	const std::vector<long>& times = GetExtTrapGradTimes(i);
+    const std::vector<float>& wave = GetExtTrapGradShape(i);
+    int nMax = times.size()-1;
+	double dM=0;
+    for (int j = 0; j<nMax; ++j)
+        dM+=(times[j+1]-times[j])*(wave[j+1]+wave[j]); // we will multiply it by 0.5 below
+    return GetGradEvent(i).amplitude * 0.5 * dM;
+}
+
+double SeqBlock::gradMomentOneArbitrary(int i)
+{
+    float* pfShape = GetArbGradShapePtr(i);
+    if (!pfShape)
+    {
+        ExternalSequence::print_msg(WARNING_MSG, std::ostringstream().flush() << "*** WARNING: SeqBlock::gradMomentOneArbitrary() called for non-decoded gradient");
+        return 0.;
+    }
+    int    nLen = GetArbGradNumSamples(i);
+    double dM
+        = ((GetGradEvent(i).first + GetGradEvent(i).last) / GetGradEvent(i).amplitude - pfShape[0] - pfShape[nLen - 1])
+          * 0.25; // TODO: is this correct??? // account for .first and .last effects (for compatibility with Matlab,
+                  // but it should really have only a very minor effect)
+    for (int j = 0; j < nLen; ++j)
+        dM += pfShape[j]; 
+    return GetGradEvent(i).amplitude * getGradientRaster() * dM;
+}
+
+bool SeqBlock::areAllGradientsConstantInRange(double dStartTimeInBlock, double dEndTimeInBlock)
+{
+	// constrain the times to the block
+    if (dStartTimeInBlock < 0.0)
+        dStartTimeInBlock = 0.0; // print warning?
+    if (dEndTimeInBlock > GetDuration())
+        dEndTimeInBlock = GetDuration(); // print warning?
+    for (int i = 0; i < NUM_GRADS; ++i)
+    {
+        if (isTrapGradient(i))
+        {
+            GradEvent& grad = GetGradEvent(i);
+            if (grad.amplitude != 0.0)
+            {
+				// check if the period (dStartTimeInBlock, dEndTimeInBlock) overlaps with the ramp-up
+                if (grad.delay < dEndTimeInBlock && grad.delay + grad.rampUpTime > dStartTimeInBlock)
+                    return false;
+                // check if the period (dStartTimeInBlock, dEndTimeInBlock) overlaps with the ramp-down
+                if (grad.delay + grad.rampUpTime + grad.flatTime < dEndTimeInBlock
+                    && grad.delay + grad.rampUpTime + grad.flatTime + grad.rampDownTime > dStartTimeInBlock)
+                    return false;
+            }
+        }
+        else if (isExtTrapGradient(i))
+        {
+            GradEvent& grad = GetGradEvent(i);
+            if (grad.amplitude!=0.0)
+            {
+                const std::vector<long>&  times = GetExtTrapGradTimes(i);
+                const std::vector<float>& wave  = GetExtTrapGradShape(i);
+                int nExtShapeSize = times.size();
+				// similar to a normal trapezoid, check if any ramp overlaps with the period (dStartTimeInBlock, dEndTimeInBlock)
+                for (int j = 0; j < nExtShapeSize - 1; ++j)
+                {
+                    if (grad.delay + times[j] >= dEndTimeInBlock)
+                        break; // no need to iterate further, we are already out of the period (dStartTimeInBlock, dEndTimeInBlock)
+                    if (grad.delay + times[j+1] <= dStartTimeInBlock)
+                        continue; // skip check as we are not yet in the period (dStartTimeInBlock, dEndTimeInBlock)
+                    if (wave[j] != wave[j + 1]) 
+                        return false;                    
+                }
+            }
+        }
+        else if (isArbitraryGradient(i))
+        {
+            GradEvent& grad = GetGradEvent(i);
+            if (grad.amplitude != 0.0)
+            {
+				if (grad.delay >= dEndTimeInBlock)
+					continue; // skip the rest as we are out of the period (dStartTimeInBlock, dEndTimeInBlock)
+                int nLen = GetArbGradNumSamples(i);
+                double dShapeDur = getGradientRaster() * nLen;
+                if (grad.delay + dShapeDur <= dStartTimeInBlock)
+                    continue; // skip the rest as we are out of the period (dStartTimeInBlock, dEndTimeInBlock)
+                // calculate the sample range that needs to be checked
+                int nStart = floor((dStartTimeInBlock - grad.delay) / getGradientRaster());
+                if (nStart < 0)
+                    nStart = 0;
+                int nEnd = ceil((dEndTimeInBlock - grad.delay) / getGradientRaster());
+                if (nEnd >= nLen)
+                    nEnd = nLen - 1;
+                if (nStart >= nEnd)
+                    continue;
+				// now look at the shape and compare samples to the first one
+                float* pfShape = GetArbGradShapePtr(i);	
+				if (!pfShape)
+				{
+					ExternalSequence::print_msg(WARNING_MSG, std::ostringstream().flush() << "*** WARNING: SeqBlock::areAllGradientsConstantInRange() called for non-decoded arbitrary gradient");
+					return false;
+				}
+                for (int j = nStart + 1; j <= nEnd; ++j)
+                    if (pfShape[nStart] != pfShape[j])
+                        return false;
+            }
+        }
+    }
+    return true;
+}

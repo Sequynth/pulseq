@@ -36,7 +36,7 @@ seq=mr.Sequence(system);
 %% Sequence events
 % Some sequence parameters are defined using standard MATLAB variables
 fov=256e-3;
-Nx=128; Ny=128; necho=16; Nslices=1;
+Nx=256; Ny=256; necho=16; Nslices=1;
 rflip=180;
 if (numel(rflip)==1), rflip=rflip+zeros([1 necho]); end
 sliceThickness=5e-3;
@@ -75,7 +75,8 @@ rfref_phase=0;
 %
 flipex=90*pi/180;
 [rfex, gz] = mr.makeSincPulse(flipex,system,'Duration',tEx,...
-    'SliceThickness',sliceThickness,'apodization',0.5,'timeBwProduct',4,'PhaseOffset',rfex_phase);
+    'SliceThickness',sliceThickness,'apodization',0.5,'timeBwProduct',4,'PhaseOffset',rfex_phase,...
+    'use','excitation');
 GSex = mr.makeTrapezoid('z',system,'amplitude',gz.amplitude,'FlatTime',tExwd,'riseTime',dG);
 % plotPulse(rfex,GSex);
 
@@ -257,14 +258,20 @@ title('2D k-space');
 % Display the first few lines of the output file
 % s=fileread('myTSE.seq');
 % disp(s(1:300))
-seq.plot();
+seq.plot('showBlocks',true,'stacked',true);
 
 %% very optional slow step, but useful for testing during development e.g. for the real TE, TR or for staying within slew rate limits  
 
 rep = seq.testReport; 
 fprintf([rep{:}]); 
 
+%% add data labels to make image reconstruction on the scanner possible
+seq.autoLabel('mirrorFourier',true,'sortSlices','descending'); % Siemens scanners need 'mirrorFourier'; On Siemens 'sortSlices'='descending' is optional, otherwise the interpreter will change the slice indexes
+
 %% Write to file
+
+seq.setDefinition('FOV', [fov fov Nslices*sliceThickness]);
+seq.setDefinition('Name', 'tse');
 
 % The sequence is written to file in compressed form according to the file
 % format specification using the |write| method.

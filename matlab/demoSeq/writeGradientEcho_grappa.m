@@ -11,19 +11,21 @@ seq=mr.Sequence(sys);         % Create a new sequence object
 fov=256e-3; Nx=128; Ny=Nx; % Define FOV and resolution
 phaseResoluion = fov/Nx / (fov/Ny) ;
 alpha=10;                  % flip angle
-thickness=3e-3;            % slice
+thickness=3.555e-3;            % slice
 Nslices=3;
-sliceGap = 1e-3 ;
+sliceGap = 1.111e-3 ;
 TR=30e-3; 
 TE=4.3e-3;
 
 % more in-depth parameters
-rfSpoilingInc=117;              % RF spoiling increment
+% RF spoiling increment = 84° for smoother transient decay, https://doi.org/10.1002/mrm.1910350216, 169° for diffusion independent rf spoiling in steady-state https://doi.org/10.1371/journal.pone.0324455
+rfSpoilingInc=84;              % RF spoiling increment
 roDuration=3.2e-3;              % ADC duration
 
 % Create alpha-degree slice selection pulse and gradient
 [rf, gz] = mr.makeSincPulse(alpha*pi/180,'Duration',3e-3,...
-    'SliceThickness',thickness,'apodization',0.42,'timeBwProduct',4,'system',sys);
+    'SliceThickness',thickness,'apodization',0.42,'timeBwProduct',4,'system',sys,...
+    'use','excitation');
 
 % Define other gradients and ADC events
 deltak=1/fov;
@@ -138,31 +140,35 @@ end
 
 %% prepare sequence export
 seq.setDefinition('FOV', [fov fov max(slicePositions)-min(slicePositions)+thickness]);
-seq.setDefinition('Name', 'gre_gt');
+seq.setDefinition('Name', 'gre_p2');
 % the following definitions have effect in conjunction with LABELs 
 seq.setDefinition('SlicePositions', slicePositions);
 seq.setDefinition('SliceThickness', thickness);
 seq.setDefinition('SliceGap', sliceGap);
+seq.setDefinition('TE', TE) ;
+seq.setDefinition('TR', TR) ;
 seq.setDefinition('kSpaceCenterLine', centerLineIdx - 1) ;
 seq.setDefinition('PhaseResolution', phaseResoluion) ;
-seq.write('gre_gt.seq')       % Write to pulseq file
+seq.write('gre_grappa_lbl.seq')       % Write to pulseq file
 
 %seq.install('siemens');
 %return
 
 %% evaluate label settings more specifically
-%seq.plot('timeRange', [0 32]*TRout, 'TimeDisp', 'ms', 'Label', 'LIN');
-adc_lbl=seq.evalLabels('evolution','adc');
-figure; plot(adc_lbl.REF);
-hold on; plot(adc_lbl.LIN);plot(adc_lbl.IMA) ; plot(adc_lbl.NOISE);
-plot(adc_lbl.SLC) ;
-plot(adc_lbl.IMA) ;
-legend('REF','LIN', 'IMA', 'SLC', 'NOISE');
-title('evolution of labels/counters');
+
+lbls=seq.evalLabels('evolution','adc');
+lbl_names=fieldnames(lbls);
+figure; hold on;
+for n=1:length(lbl_names)
+    plot(lbls.(lbl_names{n}));
+end
+legend(lbl_names(:));
+title('evolution of labels/counters/flags');
+xlabel('adc number');
 
 %% plot sequence and k-space diagrams
 
-seq.plot('timeRange', [0 256]*TR, 'TimeDisp', 'ms', 'label', 'lin');
+seq.plot('timeRange', [0 256]*TR, 'TimeDisp', 'ms', 'label', 'lin,slc');
 
 % k-space trajectory calculation
 [ktraj_adc, t_adc, ktraj, t_ktraj, t_excitation, t_refocusing] = seq.calculateKspacePP();

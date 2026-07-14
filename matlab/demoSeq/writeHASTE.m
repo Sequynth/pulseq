@@ -77,7 +77,8 @@ rfref_phase=0;
 %
 flipex=90*pi/180;
 [rfex, gz] = mr.makeSincPulse(flipex,system,'Duration',tEx,...
-    'SliceThickness',sliceThickness,'apodization',0.5,'timeBwProduct',4,'PhaseOffset',rfex_phase);
+    'SliceThickness',sliceThickness,'apodization',0.5,'timeBwProduct',4,'PhaseOffset',rfex_phase,...
+    'use', 'excitation');
 GSex = mr.makeTrapezoid('z',system,'amplitude',gz.amplitude,'FlatTime',tExwd,'riseTime',dG);
 % plotPulse(rfex,GSex);
 
@@ -251,7 +252,13 @@ figure; plot(t_ktraj, ktraj'); % plot the entire k-space trajectory
 figure; plot(ktraj(1,:),ktraj(2,:),'b',...
              ktraj_adc(1,:),ktraj_adc(2,:),'r.'); % a 2D plot
 
+%% add data labels to make image reconstruction on the scanner possible
+seq.autoLabel('mirrorFourier',true,'sortSlices','descending'); % Siemens scanners need 'mirrorFourier'; On Siemens 'sortSlices'='descending' is optional, otherwise the interpreter will change the slice indexes
+
 %% Write to file
+
+seq.setDefinition('FOV', [fov fov Nslices*sliceThickness]);
+seq.setDefinition('Name', 'haste');
 
 % The sequence is written to file in compressed form according to the file
 % format specification using the |write| method.

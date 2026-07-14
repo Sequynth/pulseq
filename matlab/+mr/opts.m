@@ -1,5 +1,5 @@
-function out=optsOld(varargin)
-%OPTS Set gradient limits of the MR system.
+function out=opts(varargin)
+%OPTS Set gradient limits and other system properties of the MR system.
 %   g=OPTS() Return the default amplitude and slew limits.
 %
 %   g=OPTS('maxGrad',30,'gradUnit','mT/m') Set the maximum gradient to
@@ -12,6 +12,7 @@ if isempty(defaultStandardOpts)
         'maxGrad',mr.convert(40,'mT/m'),...   % Default: 40 mT/m
         'maxSlew',mr.convert(170,'T/m/s'),... % Default: 170 mT/m/ms
         'maxB1',mr.convert(20,'uT'),...	      % Default: 20 uT
+        'maxFreqOffset',250e3,... % Default: +-250 kHz -- maximum frequency offset for ADC and RF; some systems may have it higher, but they are probably rare (e.g. Siemens Terra seems to accept 400kHz)
         'riseTime',[],...
         'rfDeadTime',0,...
         'rfRingdownTime',0,...
@@ -22,15 +23,22 @@ if isempty(defaultStandardOpts)
         'blockDurationRaster',10e-6,...
         'adcSamplesLimit',0,... % 0 means no limit
         'rfSamplesLimit',0,... % 0 means no limit
-        'adcSamplesDivisor',4,... % the number of which the adc.numSamples should be integer multiple 
+        'adcSamplesDivisor',4,... % the number of which the adc.numSamples should be integer multiple
+        'flag_trid', true,... % default: true; false -> can be used to ignore seq.addTRID() statements
         'gamma',42576000,...
         'B0',1.5...
     );
 end
+
 if ~isempty(defaultUserOpts)
     defaultOpts=defaultUserOpts;
 else
     defaultOpts=defaultStandardOpts;
+end
+
+if isempty(varargin) % accelerate default constructor calls
+    out=defaultOpts;
+    return
 end
 
 persistent parser
@@ -45,11 +53,12 @@ if isempty(parser)
     parser.addParamValue('slewUnit',validSlewUnits{1},...
         @(x) any(validatestring(x,validSlewUnits)));
     parser.addParamValue('b1Unit',validB1Units{1},...
-        @(x) any(validatestring(x,validSlewUnits)));
+        @(x) any(validatestring(x,validB1Units)));
     parser.addParamValue('maxGrad',[],@isnumeric);
     parser.addParamValue('maxSlew',[],@isnumeric);
     parser.addParamValue('maxB1',[],@isnumeric);
     parser.addParamValue('riseTime',[],@isnumeric);
+    parser.addParamValue('maxFreqOffset',defaultOpts.maxFreqOffset,@isnumeric);
     parser.addParamValue('rfDeadTime',defaultOpts.rfDeadTime,@isnumeric);
     parser.addParamValue('rfRingdownTime',defaultOpts.rfRingdownTime,@isnumeric);
     parser.addParamValue('adcDeadTime',defaultOpts.adcDeadTime,@isnumeric);
@@ -60,17 +69,25 @@ if isempty(parser)
     parser.addParamValue('adcSamplesLimit',defaultOpts.adcSamplesLimit,@isnumeric);
     parser.addParamValue('rfSamplesLimit',defaultOpts.rfSamplesLimit,@isnumeric);
     parser.addParamValue('adcSamplesDivisor',defaultOpts.adcSamplesDivisor,@isnumeric);
+    parser.addParamValue('flag_trid',defaultOpts.flag_trid,@(x) islogical(x) || isnumeric(x));
     parser.addParamValue('gamma',defaultOpts.gamma,@isnumeric); % Hz/T
     parser.addParamValue('B0',defaultOpts.B0,@isnumeric); % T
     parser.addParamValue('setAsDefault',false,@islogical);
+    parser.addParamValue('resetDefault',false,@islogical);
 end
 parse(parser,varargin{:});
 opt = parser.Results;
 
+if opt.resetDefault
+    defaultUserOpts=[];
+    parser=[];
+    return;
+end
+
 if isempty(opt.maxB1)
     maxB1 = defaultOpts.maxB1;
 else
-    maxGrad = mr.convert(opt.maxB1,opt.b1Unit,'Hz','gamma',opt.gamma);
+    maxB1 = mr.convert(opt.maxB1,opt.b1Unit,'Hz','gamma',opt.gamma);
 end
 if isempty(opt.maxGrad)
     maxGrad = defaultOpts.maxGrad;
@@ -80,7 +97,7 @@ end
 if isempty(opt.maxSlew)
     maxSlew=defaultOpts.maxSlew;
 else
-    maxSlew = mr.convert(opt.maxSlew,opt.slewUnit,'Hz/m','gamma',opt.gamma);
+    maxSlew = mr.convert(opt.maxSlew,opt.slewUnit,'Hz/m/s','gamma',opt.gamma);
 end
 if ~isempty(opt.riseTime)
     %maxSlew=[];
@@ -90,6 +107,7 @@ end
 out.maxGrad = maxGrad;
 out.maxSlew = maxSlew;
 out.maxB1 = maxB1;
+out.maxFreqOffset = opt.maxFreqOffset;
 out.riseTime = opt.riseTime;
 out.rfDeadTime = opt.rfDeadTime;
 out.rfRingdownTime = opt.rfRingdownTime;
@@ -101,6 +119,7 @@ out.blockDurationRaster = opt.blockDurationRaster;
 out.adcSamplesLimit = opt.adcSamplesLimit;
 out.rfSamplesLimit = opt.rfSamplesLimit;
 out.adcSamplesDivisor = opt.adcSamplesDivisor;
+out.flag_trid = logical(opt.flag_trid);
 out.gamma=opt.gamma;
 out.B0=opt.B0;
 

@@ -8,13 +8,19 @@ voxel=[20 30 40]*1e-3; % voxel size
 Nx=4096;
 Nrep=1;
 Ndummy=0;
-adcDur=256e-3; 
+adcDur=256e-3;
 rfDurEx=3000e-6;
-rfDurRef=4000e-6;
+rfDurRef=6000e-6;
 TR=3000e-3;
 TE=120e-3;
 spA=0.6e3; % spoiler area in 1/m (=Hz/m*s)
 spB=2.0e3; % spoiler area in 1/m (=Hz/m*s)
+
+%% check dependencies
+if ~mr.aux.isSigPyAvailable()
+    warning('This sequence relies on python and sigpy to generate RF pulses, the script will stop now before failing');
+    return;
+end
 
 %% Create slice-selective excitation and refocusing pulses
 % [rf_ex, g_ex, g_exReph] = mr.makeSincPulse(pi/2,'Duration',rfDurEx,...
@@ -24,7 +30,7 @@ spB=2.0e3; % spoiler area in 1/m (=Hz/m*s)
 % [rf_ref2, g_ref2] = mr.makeSincPulse(pi,'Duration',rfDurRef,'PhaseOffset',pi/2,...
 %     'SliceThickness',voxel(3),'apodization',0.6,'timeBwProduct',8,'system',system,'use','refocusing');
 [rf_ex, g_ex, g_exReph] = mr.makeSLRpulse(pi/2,'Duration',rfDurEx,...
-    'SliceThickness',voxel(1),'timeBwProduct',6,'passbandRipple',1,'stopbandRipple',1e-2,'filterType','ms','system',system);
+    'SliceThickness',voxel(1),'timeBwProduct',6,'passbandRipple',1,'stopbandRipple',1e-2,'filterType','ms','system',system, 'use', 'excitation');
 [rf_ref1, g_ref1] = mr.makeSLRpulse(pi,'Duration',rfDurRef,'PhaseOffset',pi/2,...
     'SliceThickness',voxel(2),'timeBwProduct',6,'passbandRipple',1,'stopbandRipple',1e-2,'filterType','ms','system',system,'use','refocusing');
 [rf_ref2, g_ref2] = mr.makeSLRpulse(pi,'Duration',rfDurRef,'PhaseOffset',pi/2,...
@@ -36,10 +42,10 @@ g_ref1.channel='y';
 
 %% join spoilers with the slice selection pulses of the refocusing gradients
 % step 1: create pre-gradient to merge into the plato
-g_ref1_pre=mr.makeExtendedTrapezoidArea(g_ref1.channel,0,g_ref1.amplitude,spA,system); 
+g_ref1_pre=mr.makeExtendedTrapezoidArea(g_ref1.channel,0,g_ref1.amplitude,spA,system);
 % step 2: create post-gradient to start at the plato
 g_ref1_post=mr.makeExtendedTrapezoidArea(g_ref1.channel,g_ref1.amplitude,0,spA,system);
-% step 3: create a composite gradient 
+% step 3: create a composite gradient
 g_refC1=mr.makeExtendedTrapezoid(g_ref1_pre.channel,...
     'times', [g_ref1_pre.tt g_ref1_post.tt+g_ref1_pre.shape_dur+g_ref1.flatTime],...
     'amplitudes',[g_ref1_pre.waveform g_ref1_post.waveform],'system',system);
@@ -71,10 +77,10 @@ g_spAx=mr.addGradients({g_spAx1,g_spAx2},'system', system);
 g_spBy=mr.addGradients({g_spBy1,g_spBy2},'system', system);
 g_spBx=mr.addGradients({g_spBx1,g_spBx2},'system', system);
 % update delays in g_refC1, g_refC2, rf_ref1 and rf_ref2 in case g_spAz1 is longer than g_ref1_pre
-g_refC1.delay=g_refC1.delay-mr.calcDuration(g_ref1_pre)+mr.calcDuration(g_spAz1);
-g_refC2.delay=g_refC2.delay-mr.calcDuration(g_ref2_pre)+mr.calcDuration(g_spBy1);
-rf_ref1.delay=rf_ref1.delay-mr.calcDuration(g_ref1_pre)+mr.calcDuration(g_spAz1);
-rf_ref2.delay=rf_ref2.delay-mr.calcDuration(g_ref2_pre)+mr.calcDuration(g_spBy1);
+g_refC1.delay=g_refC1.delay+max(mr.calcDuration(g_spAz1)-mr.calcDuration(g_ref1_pre),0);
+g_refC2.delay=g_refC2.delay+max(mr.calcDuration(g_spBy1)-mr.calcDuration(g_ref2_pre),0);
+rf_ref1.delay=rf_ref1.delay+max(mr.calcDuration(g_spAz1)-mr.calcDuration(g_ref1_pre),0);
+rf_ref2.delay=rf_ref2.delay+max(mr.calcDuration(g_spBy1)-mr.calcDuration(g_ref2_pre),0);
 % end spoiler
 end_sp_axes={'x','y','z'};
 for i=1:3
@@ -105,28 +111,28 @@ ws_sp_area=1 / 1e-4; % in inverse m
 %rf_ws=[None]*3
 %g_ws=[None]*3
 for i=1:3
-  rf_ws(i) = mr.makeGaussPulse(ws_fa(i) * pi / 180, 'system', system, ...      
+  rf_ws(i) = mr.makeGaussPulse(ws_fa(i) * pi / 180, 'system', system, ...
       'duration', ws_rf_dur, 'bandwidth', ws_rf_bw, 'use', 'saturation');
   g_ws(i) = mr.makeTrapezoid(ws_sp_axes{i}, 'system', system, ...
       'delay', mr.calcDuration(rf_ws(i)), 'area', ws_sp_area);
 end
 delay_ws=[ws_tau ws_tau ws_tau]; % this is an overlapping delay withn the block
-delay_ws(end)=ws_tau + rf_ws(end).delay + mr.calcRfCenter(rf_ws(end)) - rf_ex.delay - mr.calcRfCenter(rf_ex);
+delay_ws(end)=round((ws_tau + rf_ws(end).delay + mr.calcRfCenter(rf_ws(end)) - rf_ex.delay - mr.calcRfCenter(rf_ex))/system.gradRasterTime)*system.gradRasterTime;
 % new TR delay calc
 delayTR=round((TR-max(mr.calcDuration(g_ex), mr.calcDuration(rf_ex))-mr.calcDuration(g_refC1,g_spAz,g_spAx)-delayTE1-delayTE2-mr.calcDuration(g_refC2,g_spBy,g_spBx)-mr.calcDuration(adc)-mr.calcDuration(g_spEnd(1))-sum(delay_ws))/system.gradRasterTime)*system.gradRasterTime;
 assert(delayTR>=0);
 
 %% Loop over repetitions and define sequence blocks
 for i=(1-Ndummy):Nrep
-    for w=1:3                                                     % WET
-        seq.addBlock(rf_ws(w),g_ws(w),mr.makeDelay(delay_ws(w)))  % WET
-    end                                                           % WET
+    for w=1:3                                       % WET
+        seq.addBlock(rf_ws(w),g_ws(w),delay_ws(w))  % WET
+    end                                             % WET
     seq.addBlock(rf_ex,g_ex);
     seq.addBlock(mr.makeDelay(delayTE1));
     seq.addBlock(rf_ref1,g_refC1,g_spAz,g_spAx);
-    seq.addBlock(mr.makeDelay(delayTE2)); 
+    seq.addBlock(mr.makeDelay(delayTE2));
     seq.addBlock(rf_ref2,g_refC2,g_spBy,g_spBx);
-    if i>0 
+    if i>0
         seq.addBlock(adc);
     else
         seq.addBlock(mr.makeDelay(mr.calcDuration(adc)));
@@ -150,9 +156,18 @@ end
 
 seq.setDefinition('FOV', voxel);
 seq.setDefinition('Name', 'press');
+seq.setDefinition('ReceiverGainHigh',1);
 seq.write('press.seq')       % Write to pulseq file
 
 %% calculate k-space but only use it to check timing
 [ktraj_adc, t_adc, ktraj, t_ktraj, t_excitation, t_refocusing] = seq.calculateKspacePP('gradient_offset',[1500 -1200 1000]);
 
 figure; plot(t_ktraj,ktraj);title('k-space components as functions of time'); grid on;
+if ~exist('xline')
+  xline= @(x,varargin) plot([x x], ylim, varargin(:));
+end
+hold on; xline(t_excitation(1)); xline(t_refocusing(1)); xline(t_refocusing(2)); xline(t_excitation(1)+TE);
+% one we zoom in very-very much we start to notice very small errors,
+% probably related to the current inaccuracies in the calculation of the RF
+% center. These are in any case not relevant for any physical experiments.
+% TODO: double check after switching to v1.5.x

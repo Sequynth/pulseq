@@ -1,21 +1,22 @@
 % set system limits
 sys = mr.opts('MaxGrad', 22, 'GradUnit', 'mT/m', ...
-    'MaxSlew', 120, 'SlewUnit', 'T/m/s', ... 
+    'MaxSlew', 120, 'SlewUnit', 'T/m/s', ...
     'rfRingdownTime', 20e-6, 'rfDeadTime', 100e-6, 'adcDeadTime', 10e-6);
 
 seq=mr.Sequence(sys);           % Create a new sequence object
-fov=256e-3; Nx=256; Ny=256;     % Define FOV and resolution
+fov=256e-3; Nx=128; Ny=Nx;      % Define FOV and resolution
 alpha=10;                       % flip angle
 sliceThickness=3e-3;            % slice
 TR=12e-3;                       % repetition time TR
-TE=5e-3;                        % echo time TE  
+TE=5e-3;                        % echo time TE
 %TE=[7.38 9.84]*1e-3;            % alternatively give a vector here to have multiple TEs (e.g. for field mapping)
 
 % more in-depth parameters
-rfSpoilingInc=117;              % RF spoiling increment
+% RF spoiling increment = 84° for smoother transient decay, https://doi.org/10.1002/mrm.1910350216, 169° for diffusion independent rf spoiling in steady-state https://doi.org/10.1371/journal.pone.0324455
+rfSpoilingInc=84;              % RF spoiling increment
 roDuration=3.2e-3;              % ADC duration
 
-% Create fat-sat pulse 
+% Create fat-sat pulse
 % (in Siemens interpreter from January 2019 duration is limited to 8.192 ms, and although product EPI uses 10.24 ms, 8 ms seems to be sufficient)
 % B0=2.89; % 1.5 2.89 3.0
 % sat_ppm=-3.45;
@@ -25,23 +26,24 @@ roDuration=3.2e-3;              % ADC duration
 % gz_fs = mr.makeTrapezoid('z',sys,'delay',mr.calcDuration(rf_fs),'Area',1/1e-4); % spoil up to 0.1mm
 
 % Create alpha-degree slice selection pulse and gradient
-[rf, gz] = mr.makeSincPulse(alpha*pi/180,'Duration',3e-3,...
-    'SliceThickness',sliceThickness,'apodization',0.42,'timeBwProduct',4,'system',sys);
+[rf, gz] = mr.makeSincPulse(alpha*pi/180,sys,'Duration',3e-3,...
+    'SliceThickness',sliceThickness,'apodization',0.42,'timeBwProduct',4,...
+    'use','excitation');
 
 % Define other gradients and ADC events
 deltak=1/fov;
-gx = mr.makeTrapezoid('x','FlatArea',Nx*deltak,'FlatTime',roDuration,'system',sys);
-adc = mr.makeAdc(Nx,'Duration',gx.flatTime,'Delay',gx.riseTime,'system',sys);
-gxPre = mr.makeTrapezoid('x','Area',-gx.area/2,'Duration',1e-3,'system',sys);
-gzReph = mr.makeTrapezoid('z','Area',-gz.area/2,'Duration',1e-3,'system',sys);
+gx = mr.makeTrapezoid('x',sys,'FlatArea',Nx*deltak,'FlatTime',roDuration);
+adc = mr.makeAdc(Nx,sys,'Duration',gx.flatTime,'Delay',gx.riseTime);
+gxPre = mr.makeTrapezoid('x',sys,'Area',-gx.area/2,'Duration',1e-3);
+gzReph = mr.makeTrapezoid('z',sys,'Area',-gz.area/2,'Duration',1e-3);
 phaseAreas = ((0:Ny-1)-Ny/2)*deltak;
-gyPre = mr.makeTrapezoid('y','Area',max(abs(phaseAreas)),'Duration',mr.calcDuration(gxPre),'system',sys);
+gyPre = mr.makeTrapezoid('y',sys,'Area',max(abs(phaseAreas)),'Duration',mr.calcDuration(gxPre));
 peScales=phaseAreas/gyPre.area;
-        
+
 
 % gradient spoiling
-gxSpoil=mr.makeTrapezoid('x','Area',2*Nx*deltak,'system',sys);
-gzSpoil=mr.makeTrapezoid('z','Area',4/sliceThickness,'system',sys);
+gxSpoil=mr.makeTrapezoid('x',sys,'Area',2*Nx*deltak);
+gzSpoil=mr.makeTrapezoid('z',sys,'Area',4/sliceThickness);
 
 % Calculate timing
 delayTE=ceil((TE - mr.calcDuration(gxPre) - gz.fallTime - gz.flatTime/2 ...
@@ -83,6 +85,9 @@ else
     fprintf('\n');
 end
 
+%% add data labels to make image reconstruction on the scanner possible
+seq.autoLabel('mirrorFourier',true,'sortSlices','descending'); % Siemens scanners need 'mirrorFourier'; On Siemens 'sortSlices'='descending' is optional, otherwise the interpreter will change the slice indexes
+
 %% prepare sequence export
 seq.setDefinition('FOV', [fov fov sliceThickness]);
 seq.setDefinition('Name', 'gre');
@@ -105,7 +110,7 @@ figure; plot(ktraj(1,:),ktraj(2,:),'b'); % a 2D plot
 axis('equal'); % enforce aspect ratio for the correct trajectory display
 hold;plot(ktraj_adc(1,:),ktraj_adc(2,:),'r.'); % plot the sampling points
 
-%% very optional slow step, but useful for testing during development e.g. for the real TE, TR or for staying within slewrate limits  
+%% very optional slow step, but useful for testing during development e.g. for the real TE, TR or for staying within slewrate limits
 
 rep = seq.testReport;
 fprintf([rep{:}]);

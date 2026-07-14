@@ -12,7 +12,7 @@ validGradUnits={'Hz/m','mT/m','rad/ms/mm'};
 validSlewUnits={'Hz/m/s','mT/m/ms','T/m/s','rad/ms/mm/ms'};
 validUnits=cat(2,validB1Units,validGradUnits,validSlewUnits);
 if isempty(parser)
-    parser = inputParser;
+    parser = mr.aux.InputParserCompat;
     parser.FunctionName = 'convert';
     parser.addRequired('in',@isnumeric);
     parser.addRequired('fromUnit',...
@@ -33,6 +33,22 @@ if isempty(opt.toUnit)
     elseif ismember(opt.fromUnit,validB1Units)
         opt.toUnit = validB1Units{1};
     end
+end
+
+% Verify fromUnit and toUnit are in the same category.
+if ismember(opt.fromUnit,validB1Units),       fromCat = 'B1';
+elseif ismember(opt.fromUnit,validGradUnits), fromCat = 'gradient';
+elseif ismember(opt.fromUnit,validSlewUnits), fromCat = 'slew rate';
+end
+
+if ismember(opt.toUnit,validB1Units),         toCat = 'B1';
+elseif ismember(opt.toUnit,validGradUnits),   toCat = 'gradient';
+elseif ismember(opt.toUnit,validSlewUnits),   toCat = 'slew rate';
+end
+
+if ~strcmp(fromCat,toCat)
+    error('mr.convert: fromUnit ''%s'' (%s) and toUnit ''%s'' (%s) are in different unit categories.', ...
+        opt.fromUnit, fromCat, opt.toUnit, toCat);
 end
 
 % Convert to standard units

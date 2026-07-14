@@ -9,15 +9,16 @@ sys = mr.opts('MaxGrad', 28, 'GradUnit', 'mT/m', ...
 seq=mr.Sequence(sys);         % Create a new sequence object
 
 fov=224e-3; Nx=256; Ny=Nx; % Define FOV and resolution
-alpha=10;                  % flip angle
-thickness=3e-3;            % slice
+alpha=15;                  % flip angle
+thickness=5e-3;            % slice
 Nslices=1;
 TR=10e-3; 
 TE=4.3e-3;
 %TE=[7.38 9.84 15]*1e-3;            % alternatively give a vector here to have multiple TEs (e.g. for field mapping)
 
 % more in-depth parameters
-rfSpoilingInc=117;              % RF spoiling increment
+% RF spoiling increment = 84° for smoother transient decay, https://doi.org/10.1002/mrm.1910350216, 169° for diffusion independent rf spoiling in steady-state https://doi.org/10.1371/journal.pone.0324455
+rfSpoilingInc=84;              % RF spoiling increment
 roDuration=3.2e-3;              % ADC duration
 
 % Create fat-sat pulse 
@@ -31,7 +32,7 @@ roDuration=3.2e-3;              % ADC duration
 
 % Create alpha-degree slice selection pulse and gradient
 [rf, gz] = mr.makeSincPulse(alpha*pi/180,'Duration',3e-3,...
-    'SliceThickness',thickness,'apodization',0.42,'timeBwProduct',4,'system',sys);
+    'SliceThickness',thickness,'apodization',0.42,'timeBwProduct',4,'use','excitation','system',sys);
 
 % Define other gradients and ADC events
 deltak=1/fov;
@@ -60,6 +61,9 @@ rf_inc=0;
 % so we will just increment LIN after the ADC event (e.g. during the spoiler)
 
 seq.addBlock(mr.makeLabel('SET','REV', 1)); % left-right swap fix (needed for 1.4.0)
+
+for r=1:2
+seq.addBlock(mr.makeLabel('SET','LIN', 0), mr.makeLabel('SET','SLC', 0)); % needed to make it compatible to multiple REPs
 
 % loop over slices
 for s=1:Nslices
@@ -94,6 +98,9 @@ for s=1:Nslices
         seq.addBlock(spoilBlockContents{:});
       end
     end
+end
+seq.addBlock(mr.makeDelay(5));
+seq.addBlock(mr.makeLabel('INC','REP', 1)); % make the sequence compatible with multiple runs/repetitions
 end
 
 %% check whether the timing of the sequence is correct
@@ -133,11 +140,16 @@ hold;plot(ktraj_adc(1,:),ktraj_adc(2,:),'r.'); % plot the sampling points
 title('2D k-space');
 
 %% evaluate label settings more specifically
-adc_lbl=seq.evalLabels('evolution','adc');
-figure; plot(adc_lbl.SLC);
-hold on; plot(adc_lbl.LIN);
-legend('slc','lin');
-title('evolution of labels/counters');
+
+lbls=seq.evalLabels('evolution','adc');
+lbl_names=fieldnames(lbls);
+figure; hold on;
+for n=1:length(lbl_names)
+    plot(lbls.(lbl_names{n}));
+end
+legend(lbl_names(:));
+title('evolution of labels/counters/flags');
+xlabel('adc number');
 
 %% very optional slow step, but useful for testing during development e.g. for the real TE, TR or for staying within slewrate limits  
 

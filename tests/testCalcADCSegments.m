@@ -1,0 +1,116 @@
+% this test is not yet Octave-compatible, therefore markup % ! with a space in between
+% !test %%% on Octave run with oruntests() %%%
+% ! testCalcADCSegments
+function tests = testCalcADCSegments
+    try
+        mr.opts();
+    catch
+        pulseqPath=fullfile(fileparts(mfilename),'..','matlab');
+        addpath(genpath(pulseqPath));
+    end
+    if exist('functiontests')
+        tests = functiontests(localfunctions);
+    else
+        lf=localfunctions();
+        testCase=makeOctaveTestCase();
+        for i=1:length(lf)
+            f=lf{i};
+            n=func2str(f);
+            if length(n)>3 && strcmp(n(1:4),'test')
+                f(testCase);
+                fprintf('Test function %s completed successfully\n', n);
+            end
+        end
+    end
+end
+
+%% Setup function: Load test data
+function setup(testCase)
+    import mr.*
+    dirpath = fileparts(mfilename('fullpath')); % Get script directory
+
+    % Load expected output data
+    data = readmatrix(fullfile(dirpath, 'expected_output', 'pulseq_calcAdcSeg.txt'));
+
+    % the full test is too slow, so we can accelerate it by skiping some test condition combinations
+    test_subset = 1:10:size(data,1); % change the step parameter to sub-sample tests
+
+    % Assign structured data fields
+    testCase.TestData.dwell = data(test_subset, 1);
+    testCase.TestData.num_samples = data(test_subset, 2);
+    testCase.TestData.adc_limit = data(test_subset, 3);
+    testCase.TestData.adc_divisor = data(test_subset, 4);
+    testCase.TestData.mode = data(test_subset, 5);
+    testCase.TestData.res_num_seg = data(test_subset, 6);
+    testCase.TestData.res_num_samples_seg = data(test_subset, 7);
+
+    % Define system options
+    testCase.TestData.system = opts;
+    testCase.TestData.system.adcRasterTime = 1e-7;
+    testCase.TestData.system.gradRasterTime = 1e-5;
+end
+
+%% Helper function to check if an error is thrown
+function verifyErrorThrown(testCase, funcHandle)
+    didError = false;
+    try
+        funcHandle();
+    catch
+        didError = true;
+    end
+    testCase.verifyTrue(didError, 'Expected an error, but none was thrown.');
+end
+
+%% Main Test Function
+function testCalcADC(testCase)
+    sys = testCase.TestData.system;
+
+    % Loop through all test cases
+    for i = 1:length(testCase.TestData.dwell)
+        dwell = testCase.TestData.dwell(i);
+        num_samples = testCase.TestData.num_samples(i);
+        adc_limit = testCase.TestData.adc_limit(i);
+        adc_divisor = testCase.TestData.adc_divisor(i);
+        res_num_seg = testCase.TestData.res_num_seg(i);
+        res_num_samples_seg = testCase.TestData.res_num_samples_seg(i);
+        modeNum = testCase.TestData.mode(i);
+
+        % Convert mode number to string
+        if modeNum == 1
+            mode = 'shorten';
+        else
+            mode = 'lengthen';
+        end
+
+        % Update system settings
+        sys.adcSamplesLimit = adc_limit;
+        sys.adcSamplesDivisor = adc_divisor;
+
+        % Run function under test
+        [num_seg, num_samples_seg] = mr.calcAdcSeg(num_samples, dwell, sys, mode);
+
+        % Validate results against expected values
+        testCase.verifyEqual(num_seg, res_num_seg, 'AbsTol', 1e-9);
+        testCase.verifyEqual(num_samples_seg, res_num_samples_seg, 'AbsTol', 1e-9);
+
+        % Check if segment samples are within the sample limit
+        testCase.verifyLessThanOrEqual(num_samples_seg, adc_limit);
+
+        % Compute durations
+        seg_duration = num_samples_seg * dwell;
+        adc_duration = seg_duration * num_seg;
+
+        % Check segment alignment with grad raster time
+        testCase.verifyTrue(abs(round(seg_duration / sys.gradRasterTime) - (seg_duration / sys.gradRasterTime)) < 1e-9, ...
+            'Segment duration is not aligned with grad raster time');
+
+        % Check total ADC alignment with grad raster time
+        testCase.verifyTrue(abs(round(adc_duration / sys.gradRasterTime) - (adc_duration / sys.gradRasterTime)) < 1e-9, ...
+            'ADC duration is not aligned with grad raster time');
+
+        % Display progress
+        if mod(i, 1000) == 0 || i == length(testCase.TestData.dwell)
+            fprintf('Progress: %.2f%%\n', i / length(testCase.TestData.dwell) * 100);
+        end
+    end
+end

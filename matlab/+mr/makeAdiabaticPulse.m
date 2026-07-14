@@ -10,63 +10,65 @@ function [rf, gz, gzr, delay] = makeAdiabaticPulse(type,varargin)
 %
 %     hypsec(n=512, beta=800, mu=4.9, dur=0.012)
 %         Design a hyperbolic secant adiabatic pulse.
-%         
+%
 %         mu * beta becomes the amplitude of the frequency sweep
-%         
+%
 %         Args:
 %             n (int): number of samples (should be a multiple of 4).
 %             beta (float): AM waveform parameter.
 %             mu (float): a constant, determines amplitude of frequency sweep.
 %             dur (float): pulse time (s).
-%         
+%
 %         Returns:
 %             2-element tuple containing
-%         
+%
 %             - **a** (*array*): AM waveform.
 %             - **om** (*array*): FM waveform (radians/s).
-%         
+%
 %         References:
 %             Baum, J., Tycko, R. and Pines, A. (1985). 'Broadband and adiabatic
 %             inversion of a two-level system by phase-modulated pulses'.
 %             Phys. Rev. A., 32:3435-3447.
-%     
+%
 %     wurst(n=512, n_fac=40, bw=40000.0, dur=0.002)
 %         Design a WURST (wideband, uniform rate, smooth truncation) adiabatic
 %          inversion pulse
-%         
+%
 %         Args:
 %             n (int): number of samples (should be a multiple of 4).
 %             n_fac (int): power to exponentiate to within AM term. ~20 or greater is
 %              typical.
 %             bw (float): pulse bandwidth.
 %             dur (float): pulse time (s).
-%         
-%         
+%
+%
 %         Returns:
 %             2-element tuple containing
 %            - **a** (*array*): AM waveform.
 %             - **om** (*array*): FM waveform (radians/s).
-%         
+%
 %         References:
 %             Kupce, E. and Freeman, R. (1995). 'Stretched Adiabatic Pulses for
 %             Broadband Spin Inversion'.
 %             J. Magn. Reson. Ser. A., 117:246-256.
 
-            
+
 validPulseTypes = {'hypsec','wurst'};
 validPulseUses = mr.getSupportedRfUse();
 
 persistent parser
 if isempty(parser)
-    parser = inputParser;
+    parser = mr.aux.InputParserCompat;
     parser.FunctionName = 'makeAdiabaticPulse';
-    
+
     % RF params
     addRequired(parser, 'type', @(x) any(validatestring(x,validPulseTypes)));
-    addOptional(parser, 'system', mr.opts(), @isstruct);
+    addOptional(parser, 'system', [], @isstruct);
     addParamValue(parser, 'duration', 10e-3, @isnumeric);
     addParamValue(parser, 'freqOffset', 0, @isnumeric);
     addParamValue(parser, 'phaseOffset', 0, @isnumeric);
+    addParamValue(parser, 'freqPPM', 0, @isnumeric);
+    addParamValue(parser, 'phasePPM', 0, @isnumeric);
     addParamValue(parser, 'beta', 800, @isnumeric);
     addParamValue(parser, 'mu', 4.9, @isnumeric);
     addParamValue(parser, 'n_fac', 40, @isnumeric);
@@ -79,50 +81,48 @@ if isempty(parser)
     addParamValue(parser, 'delay', 0, @isnumeric);
     addParamValue(parser, 'dwell', 0, @isnumeric); % dummy default value
     % whether it is a refocusing pulse (for k-space calculation)
-    addOptional(parser, 'use', '', @(x) any(validatestring(x,validPulseUses)));
-    % optional Python command 
+    addParamValue(parser, 'use', 'u', @(x) any(validatestring(x,validPulseUses)));
+    % optional Python command
     addParamValue(parser, 'pythonCmd', '', @(x)isstring(x)||ischar(x));
 end
 
 parse(parser, type, varargin{:});
 opt = parser.Results;
 
-if opt.dwell==0
-    opt.dwell=opt.system.rfRasterTime;
+if isempty(opt.system)
+    sys=mr.opts();
+else
+    sys=opt.system;
 end
 
-% find/check python 
+if opt.dwell==0
+    opt.dwell=sys.rfRasterTime;
+end
+
+% find/check python
 if ~isempty(opt.pythonCmd)
     [status, result]=system([opt.pythonCmd ' --version']);
     if status~=0
         error(['provided python executable ''' opt.pythonCmd ''' returns an error on the version check']);
     end
+    if ispc
+        [status, result] = system(sprintf('%s  -c "import sigpy" 2>nul',opt.pythonCmd));
+    else
+        [status, result] = system(sprintf('%s  -c "import sigpy" 2>/dev/null',opt.pythonCmd));
+    end
+    if status~=0
+        error(['provided python executable ''' opt.pythonCmd ''' returns an error on the sigPy check']);
+    end
     python=opt.pythonCmd;
-elseif ispc()
-    % on Windows we rely on the PATH settings
-    [status, result]=system('python --version');
-    if status==0
-        python='python';
-    else
-        [status, result]=system('py --version');
-        if status~=0
-            error('python executable not found, please check your system PATH settings');
-        end
-        python='py';
-    end
 else
-    % this probably only works on linux and maybe also on mac
-    [status, result]=system('which python3');
-    if status==0
-        python=strip(result);
-    else
-        [status, result]=system('which python');
-        if status==0
-            python=strip(result);
-        else
-            error('python executable not found');
-        end
+    [avail, python]=mr.aux.isSigPyAvailable();
+    if ~avail
+        error('python executable with installed sigPy not found, please check your system PATH settings and Python installation');
     end
+end
+% add quotes in case Python install path contains spaces or alike characters
+if python(1)~='"'
+  python=['"' python '"'];
 end
 
 Nraw = round(opt.duration/opt.dwell+eps);
@@ -166,7 +166,7 @@ if status~=0
     error('executing python command failed');
 end
 
-lines = regexp(result,'\n','split'); % the response from the python call contains some garbage 
+lines = regexp(result,'\n','split'); % the response from the python call contains some garbage
 % look for two usable result vectors
 for i=1:length(lines)-1
     try
@@ -188,7 +188,7 @@ pm=cumsum(fm)*opt.dwell;
 [dfm,ifm]=min(abs(fm)); % find the center of the pulse
 % we will also use the ocasion to find the rate of change of the frequency
 % at the center of the pulse
-if dfm==0 
+if dfm==0
     pm0=pm(ifm);
     am0=am(ifm);
     roc_fm0=abs(fm(ifm+1)-fm(ifm-1))/2/opt.dwell;
@@ -225,9 +225,12 @@ rf.t = t;
 rf.shape_dur=N*opt.dwell;
 rf.freqOffset = opt.freqOffset;
 rf.phaseOffset = opt.phaseOffset;
-rf.deadTime = opt.system.rfDeadTime;
-rf.ringdownTime = opt.system.rfRingdownTime;
+rf.freqPPM = opt.freqPPM;
+rf.phasePPM = opt.phasePPM;
+rf.deadTime = sys.rfDeadTime;
+rf.ringdownTime = sys.rfRingdownTime;
 rf.delay = opt.delay;
+rf.center = mr.calcRfCenter(rf);
 if ~isempty(opt.use)
     rf.use=opt.use;
 else
@@ -240,12 +243,12 @@ end
 if nargout > 1
     assert(opt.sliceThickness > 0,'SliceThickness must be provided');
     if opt.maxGrad > 0
-        opt.system.maxGrad = opt.maxGrad;
+        sys.maxGrad = opt.maxGrad;
     end
     if opt.maxSlew > 0
-        opt.system.maxSlew = opt.maxSlew;
+        sys.maxSlew = opt.maxSlew;
     end
-    
+
     switch type
         case 'hypsec'
             BW=mr.calcRfBandwidth(rf,0.1);
@@ -254,18 +257,17 @@ if nargout > 1
         otherwise
             error('unsupported pulse type')
     end
-    centerpos=mr.calcRfCenter(rf);
-    
+
     amplitude = BW/opt.sliceThickness;
     area = amplitude*opt.duration;
-    gz = mr.makeTrapezoid('z', opt.system, 'flatTime', opt.duration, ...
+    gz = mr.makeTrapezoid('z', sys, 'flatTime', opt.duration, ...
                           'flatArea', area);
-    gzr= mr.makeTrapezoid('z', opt.system, 'Area', -area*(1-centerpos)-0.5*(gz.area-area));
+    gzr= mr.makeTrapezoid('z', sys, 'Area', -area*(1-rf.center/rf.shape_dur)-0.5*(gz.area-area));
     if rf.delay > gz.riseTime
-        gz.delay = ceil((rf.delay - gz.riseTime)/opt.system.gradRasterTime)*opt.system.gradRasterTime; % round-up to gradient raster
+        gz.delay = ceil((rf.delay - gz.riseTime)/sys.gradRasterTime)*sys.gradRasterTime; % round-up to gradient raster
     end
     if rf.delay < (gz.riseTime+gz.delay)
-        rf.delay = gz.riseTime+gz.delay; % these are on the grad raster already which is coarser 
+        rf.delay = gz.riseTime+gz.delay; % these are on the grad raster already which is coarser
     end
 end
 
@@ -275,14 +277,14 @@ end
 %     rf.t = [rf.t rf.t(end)+tFill];
 %     rf.signal = [rf.signal, zeros(size(tFill))];
 % end
-if rf.ringdownTime > 0 && nargout > 3
-    delay=mr.makeDelay(mr.calcDuration(rf)+rf.ringdownTime);
+if nargout > 3
+    delay=mr.makeDelay(mr.calcDuration(rf)); % calcDuration already includes the ringdown time
 end
 
 % RF amplitude check
 rf_amplitude=max(abs(rf.signal));
-if rf_amplitude>opt.system.maxB1
-    warning('WARNING: system maximum RF amplitude exceeded (%.01f%%)', rf_amplitude/opt.system.maxB1*100);
+if rf_amplitude>sys.maxB1
+    warning('WARNING: system maximum RF amplitude exceeded (%.01f%%)', rf_amplitude/sys.maxB1*100);
 end
 
 end

@@ -1,4 +1,4 @@
-% this is an experimentaal high-performance EPI sequence
+% this is an experimental high-performance EPI sequence
 % which uses split gradients to overlap blips with the readout
 % gradients combined with ramp-samping
 % strongly leaned towards the Siemens EPI_BOLD sequence 
@@ -15,9 +15,9 @@ seq=mr.Sequence(sys);      % Create a new sequence object
 fov=220e-3; Nx=96; Ny=Nx;  % Define FOV and resolution
 thickness=3e-3;            % slice thinckness in mm
 sliceGap=1.5e-3;             % slice gap im mm
-Nslices=48;
+Nslices=4;
 Nrep = 1 ;
-TR = 3500e-3 ;
+TR = 3000e-3 ;
 
 pe_enable=1;               % a flag to quickly disable phase encoding (1/0) as needed for the delay calibration
 ro_os=2;                   % oversampling factor (in contrast to the product sequence we don't really need it)
@@ -29,11 +29,11 @@ partFourierFactor=1;       % partial Fourier factor: 1: full sampling 0: start w
 Nnav=3;		   % navigator echoes for ghost supprerssion
 
 % Create fat-sat pulse 
-sat_ppm=-3.45;
-sat_freq=sat_ppm*1e-6*sys.B0*sys.gamma;
-rf_fs = mr.makeGaussPulse(110*pi/180,'system',sys,'Duration',8e-3,'dwell',10e-6,...
-    'bandwidth',abs(sat_freq),'freqOffset',sat_freq,'use','saturation');
-rf_fs.phaseOffset=-2*pi*rf_fs.freqOffset*mr.calcRfCenter(rf_fs); % compensate for the frequency-offset induced phase    
+sat_ppm=-3.35;
+rf_fs = mr.makeGaussPulse(110*pi/180,'system',sys,'Duration',8e-3,...
+    'bandwidth',abs(sat_ppm*1e-6*sys.B0*sys.gamma),'freqPPM',sat_ppm,'use','saturation');
+rf_fs.phasePPM=-2*pi*rf_fs.freqPPM*rf_fs.center; % compensate for the frequency-offset induced phase    
+
 gz_fs = mr.makeTrapezoid('z',sys,'delay',mr.calcDuration(rf_fs),'Area',0.1/1e-4); % spoil up to 0.1mm
 % Create 90 degree slice selection pulse and gradient
 [rf, gz, gzReph] = mr.makeSincPulse(pi/2,'system',sys,'Duration',2e-3,...
@@ -82,7 +82,7 @@ adcDwell=floor(readoutTime/adcSamples*1e7)*1e-7;
 disp(['ADC bandwidth = ', num2str(1/adcDwell/1000), ' kHz']) ;
 fprintf('Actual RO oversampling factor is %g, Siemens recommends it to be above 1.3\n', deltak/gx.amplitude/adcDwell)
 % MZ: no idea, whether ceil,round or floor is better for the adcSamples...
-adc = mr.makeAdc(adcSamples,'Dwell',adcDwell,'Delay',blip_dur/2);
+adc = mr.makeAdc(adcSamples,'Dwell',adcDwell,'Delay',blip_dur/2,'phaseModulation',0.1*rand(1,adcSamples));
 % realign the ADC with respect to the gradient
 time_to_center=adc.dwell*((adcSamples-1)/2+0.5); % I've been told that Siemens samples in the center of the dwell period
 adc.delay=round((gx.riseTime+gx.flatTime/2-time_to_center)*1e6)*1e-6; % we adjust the delay to align the trajectory with the gradient. We have to aligh the delay to 1us 
@@ -119,18 +119,19 @@ gyPre.amplitude=gyPre.amplitude*pe_enable;
 slicePositions=(thickness+sliceGap)*((0:(Nslices-1)) - (Nslices-1)/2);
 slicePositions=slicePositions([1:2:Nslices 2:2:Nslices]); % reorder slices for an interleaved acquisition (optional)
 %slicePositions=slicePositions([1:3:Nslices 2:3:Nslices 3:3:Nslices]); % reorder slices for an interleaved acquisition (optional)
-% Define sequence blocks
-TR_1slice = mr.calcDuration(gz_fs) + mr.calcDuration(gz) + mr.calcDuration(gzReph)+...
+% estimate sequence timing
+minTR_1slice = mr.calcDuration(gz_fs) + mr.calcDuration(gz) + mr.calcDuration(gzReph)+...
     Nnav*mr.calcDuration(gx) + mr.calcDuration(gyPre) + ...
     Ny_meas*mr.calcDuration(gx) ;
-TRdelay = TR - TR_1slice * Nslices ;
-TRdelay_perSlice = ceil(TRdelay / Nslices / sys.blockDurationRaster) * sys.blockDurationRaster ;
-assert(TRdelay_perSlice>=0 ) ;
 
-TE = rf.shape_dur/2 + rf.ringdownTime + mr.calcDuration(gzReph)+...
+% calculate minimal TE (or besster to say actual TE if we don't add any TE filling delays)
+min_TE = rf.shape_dur-rf.center + max(rf.ringdownTime, gz.fallTime) + mr.calcDuration(gzReph)+...
     Nnav*mr.calcDuration(gx) + mr.calcDuration(gyPre) + ...
-    Ny_meas/2*mr.calcDuration(gx) - mr.calcDuration(gx)/2;
-disp(['TR = ', num2str(TR), ' s', ', TE = ', num2str(1000*TE), ' ms']) ;
+    Ny_pre*mr.calcDuration(gx) + mr.calcDuration(gx)/2;
+
+TRdelay = TR - minTR_1slice * Nslices ;
+TRdelay_perSlice = round(TRdelay / Nslices / sys.blockDurationRaster) * sys.blockDurationRaster ;
+assert(TRdelay_perSlice>0 ) ;
 
 % change orientation to match the siemens product sequence
 % reverse the polarity of all gradients in readout direction (Gx)
@@ -147,7 +148,7 @@ for r=1:Nrep
     for s=1:Nslices
         seq.addBlock(rf_fs, gz_fs) ;
         rf.freqOffset=gz.amplitude*slicePositions(s);
-        rf.phaseOffset=-2*pi*rf.freqOffset*mr.calcRfCenter(rf); % compensate for the slice-offset induced phase
+        rf.phaseOffset=-2*pi*rf.freqOffset*rf.center; % compensate for the slice-offset induced phase
         seq.addBlock(rf,gz,trig);
         if Nnav>0
             gxPre = mr.scaleGrad(gxPre, -1) ; % reverse the readout gradient in advance for navigator
@@ -163,6 +164,7 @@ for r=1:Nrep
                 seq.addBlock(gx, adc);
                 gx = mr.scaleGrad(gx, -1) ;   % Reverse polarity of read gradient
             end
+            % softdelay TE
             seq.addBlock(gyPre,  ...
                 mr.makeLabel('SET','LIN', -1), ... % increment LIN by -1 for "llin" performs before adc below
                 mr.makeLabel('SET','NAV', 0), ...
@@ -191,7 +193,10 @@ for r=1:Nrep
         if sign(gx.amplitude) ~= ROpolarity % if the polarity of gx is not the same as original one
             gx = mr.scaleGrad(gx, -1) ;
         end
-       % seq.addBlock(mr.makeDelay(TRdelay_perSlice)) ; % use the minimal TR
+       if s==1 && r==1
+           durPerSlc=sum(seq.blockDurations);
+       end
+       seq.addBlock(TRdelay_perSlice);
     end
     seq.addBlock(mr.makeLabel('INC','REP', 1)) ;
 end
@@ -207,9 +212,11 @@ else
     fprintf('\n');
 end
 
+%[ktraj_adc, t_adc, ktraj, t_ktraj, t_excitation, t_refocusing, slicepos, t_slicepos] = seq.calculateKspacePP();
+
 %% do some visualizations
 
-seq.plot('Label', 'SEG,LIN,SLC') ;             % Plot all sequence waveforms
+seq.plot('Label', 'SEG,LIN,SLC', 'timeRange', [0 TR]) ;             % Plot all sequence waveforms
 
 seq.plot('timeDisp','us','showBlocks',1,'timeRange',[0 25e-3]); %detailed view
 
@@ -252,57 +259,31 @@ seq.setDefinition('ReceiverGainHigh',1);
 %seq.setDefinition('kSpaceCenterLine', Ny/2+1) ;
 seq.setDefinition('ReadoutOversamplingFactor',ro_os);
 seq.setDefinition('TargetGriddedSamples',Nx*ro_os); % number of samples after gridding (with oversamping)
-seq.setDefinition('TrapezoidGriddingParameters', [gx.riseTime gx.flatTime gx.fallTime adc.delay-gx.delay adc.duration]); % rise,flat,fall,adc_delay,adc_dur
+seq.setDefinition('TrapezoidGriddingParameters', [gx.riseTime gx.flatTime gx.fallTime adc.delay-gx.delay adc.dwell*adc.numSamples]); % rise,flat,fall,adc_delay,adc_dur
 
-seq.write('epi_rs.seq'); 
+seq.write('epi_rs_lbl.seq'); 
 
 % seq.install('siemens');
 
 % seq.sound(); % simulate the seq's tone
 
 %% evaluate label settings
-adc_lbl=seq.evalLabels('evolution','adc');
-figure; plot(adc_lbl.SLC);
-hold on; plot(adc_lbl.LIN);
-plot(adc_lbl.SEG); plot(adc_lbl.AVG);plot(adc_lbl.REP);
-legend('slc','lin','seg','avg','rep');
-title('evolution of labels/counters');
-return;
 
-%% another manual pretty plot option for gradients
+lbls=seq.evalLabels('evolution','adc');
+lbl_names=fieldnames(lbls);
+figure; hold on;
+for n=1:length(lbl_names)
+    plot(lbls.(lbl_names{n}));
+end
+legend(lbl_names(:));
+title('evolution of labels/counters/flags');
+xlabel('adc number');
 
-lw=1;
-%gw=seq.gradient_waveforms();
-wave_data=seq.waveforms_and_times(true); % also export RF
-gwm=max(abs([wave_data{1:3}]'));
-rfm=max(abs([wave_data{4}]'));
-ofs=2.05*gwm(2);
+%% another pretty plot option e.g. for publications
 
-% plot "axes"
-figure; 
-axis_clr=[0.5,0.5,0.5];
-plot([-0.01*gwm(1),1.01*gwm(1)],[0 0]*ofs,'Color',axis_clr,'LineWidth',lw/5); hold on; 
-plot([-0.01*gwm(1),1.01*gwm(1)],[1 1]*ofs,'Color',axis_clr,'LineWidth',lw/5);
-plot([-0.01*gwm(1),1.01*gwm(1)],[2 2]*ofs,'Color',axis_clr,'LineWidth',lw/5);
-plot([-0.01*gwm(1),1.01*gwm(1)],[3 3]*ofs,'Color',axis_clr,'LineWidth',lw/5);
+seq.paperPlot('blockRange',[1 41]);
 
-% plot the RF waveform
-plot(wave_data{4}(1,:), abs(wave_data{4}(2,:))/rfm(2)*gwm(2)*0.75+3*ofs,'k','LineWidth',lw); 
-
-% plot the entire gradient waveforms
-plot(wave_data{3}(1,:), wave_data{3}(2,:)+2*ofs,'Color',[0,0.5,0.3],'LineWidth',lw); 
-plot(wave_data{2}(1,:), wave_data{2}(2,:)+1*ofs,'r','LineWidth',lw);
-plot(wave_data{1}(1,:), wave_data{1}(2,:),'b','LineWidth',lw);
-t_adc_gr=t_adc+0.5*seq.gradRasterTime; % we have to shift the time axis because it is otherwise adpted to the k-space, which is a one-sided integration of the trajectory
-gwr_adc=interp1(wave_data{1}(1,:), wave_data{1}(2,:),t_adc_gr);
-plot(t_adc_gr,gwr_adc,'b.','MarkerSize',5*lw); % and sampling points on the kx-axis
-
-xlim([-0.03*gwm(1),1.03*gwm(1)]);
-
-set(gca,'xtick',[]);
-set(gca,'xticklabel',[]);
-set(gca,'ytick',[]);
-set(gca,'yticklabel',[]);
+return
 
 %% very optional slow step, but useful for testing during development e.g. for the real TE, TR or for staying within slew rate limits  
 
