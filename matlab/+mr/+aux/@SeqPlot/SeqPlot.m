@@ -39,6 +39,27 @@ classdef SeqPlot < handle
 
         hSeq
 
+        labels          % cell array of waveform names, one per axis
+        axVisible       % logical vector, current visibility of each axis
+        stackedMode     % logical, whether the stacked layout is active
+        xLabelStr       % x-axis label string, e.g. 't (ms)'
+        initialXLim     % initial x-axis limits, used to reset the zoom
+        initialYLim     % initial y-axis limits per axis (Nx2), used to reset the zoom
+        timeFormatStr   % printf format + unit, e.g. '%.4f ms', for the info bar
+
+        controlPanel    % uipanel at the top holding the control buttons
+        waveformButtons % array of togglebutton uicontrols, one per axis
+        zoomButton      % togglebutton uicontrol for zoom
+        panButton       % togglebutton uicontrol for pan
+        linkGradButton  % togglebutton uicontrol for gradient y-axis linking
+
+        gradYLinked     % logical, whether Gx/Gy/Gz share one y-scale
+        gradYListeners  % cell array of YLim PostSet listeners for Gx/Gy/Gz
+        syncingGradYLim % re-entrancy guard while propagating a linked y-zoom
+
+        infoPanel       % uipanel at the bottom showing the guide time
+        hTextInfo       % text uicontrol inside infoPanel
+
     end
 
     properties (Constant = true, Hidden = true)
@@ -51,6 +72,14 @@ classdef SeqPlot < handle
         mx1 = 70;
         % right horizontal margin
         mx2 = 5;
+
+        % height of the top control-button panel (px)
+        controlPanelHeight = 26;
+        % height of the bottom info panel (px)
+        infoPanelHeight = 20;
+
+        % indices into obj.ax of the Gx/Gy/Gz gradient axes
+        gradAxIdx = [4 5 6];
 
     end
 
@@ -78,6 +107,8 @@ classdef SeqPlot < handle
             parse(parser,varargin{:});
             opt = parser.Results;
 
+            obj.stackedMode = logical(opt.stacked);
+
             if mr.aux.isOctave()
               if opt.stacked
                 warning('Option stacked is not (yet) supported by Octave');
@@ -103,13 +134,17 @@ classdef SeqPlot < handle
             obj.ax=obj.ax([1 3 5 2 4 6]);   % Re-order axes
             arrayfun(@(x)hold(x,'on'),obj.ax);
             arrayfun(@(x)grid(x,'on'),obj.ax);
-            labels={'ADC/lbl/trig','RF mag (Hz)','RF/ADC ph (rad)','Gx (kHz/m)','Gy (kHz/m)','Gz (kHz/m)'};
-            arrayfun(@(x)ylabel(obj.ax(x),labels{x}),1:6);
+            obj.labels={'ADC/lbl/trig','RF mag (Hz)','RF/ADC ph (rad)','Gx (kHz/m)','Gy (kHz/m)','Gz (kHz/m)'};
+            arrayfun(@(x)ylabel(obj.ax(x),obj.labels{x}),1:6);
+            if ~mr.aux.isOctave()
+                % hide the per-axes interactive toolbar; the custom
+                % control panel provides zoom/pan/show-hide instead
+                arrayfun(@(x)set(x.Toolbar,'Visible','off'),obj.ax);
+            end
 
             tFactorList = [1 1e3 1e6];
             tFactor = tFactorList(strcmp(opt.timeDisp,validTimeUnits));
-            xlabel(obj.ax(3),['t (' opt.timeDisp ')']);
-            xlabel(obj.ax(6),['t (' opt.timeDisp ')']);
+            obj.xLabelStr = ['t (' opt.timeDisp ')'];
 
             t0=0;
             label_defined=false;
@@ -140,6 +175,7 @@ classdef SeqPlot < handle
                 otherwise
                     timeFormat='%.7f';
             end
+            obj.timeFormatStr = [timeFormat ' ' opt.timeDisp];
 
             % data cursor callback
             if ~mr.aux.isOctave()
@@ -321,17 +357,41 @@ classdef SeqPlot < handle
 
             % Set axis limits and zoom properties
             dispRange = tFactor*[timeRange(1) min(timeRange(2),t0)];
+            obj.initialXLim = dispRange;
             arrayfun(@(x)xlim(x,dispRange),obj.ax);
             linkaxes(obj.ax(:),'x')
             if ~mr.aux.isOctave()
               h = zoom(obj.f);
               setAxesZoomMotion(h,obj.ax(1),'horizontal');
+              p = pan(obj.f);
+              p.Motion = 'horizontal';
             end
             % manually fix the phase vertical scale to +- pi
             ylim(obj.ax(3),[-pi pi]);
             % make Y-axes little bit less tight
             arrayfun(@(x) ylim(x, ylim(x) + 0.03*[-1 1]*sum(ylim(x).*[-1 1])), obj.ax(2:end));
 
+            obj.initialYLim = zeros(numel(obj.ax), 2);
+            for ii = 1:numel(obj.ax)
+                obj.initialYLim(ii,:) = ylim(obj.ax(ii));
+            end
+
+            % Gx/Gy/Gz start out independently scaled (each to its own
+            % initial range); the "Link Grad Y" button switches them to a
+            % shared scale. The listeners propagate interactive y-zooming
+            % between the three while linked, regardless of mode changes.
+            obj.gradYLinked = false;
+            obj.syncingGradYLim = false;
+            if ~mr.aux.isOctave()
+                obj.gradYListeners = cell(1, numel(obj.gradAxIdx));
+                for k = 1:numel(obj.gradAxIdx)
+                    idx = obj.gradAxIdx(k);
+                    obj.gradYListeners{k} = addlistener(obj.ax(idx), 'YLim', 'PostSet', ...
+                        @(~,~) obj.onGradYLimChanged(idx));
+                end
+            end
+
+            obj.axVisible = true(1, numel(obj.ax));
 
             if opt.showGuides
               if mr.aux.isOctave()
@@ -342,14 +402,28 @@ classdef SeqPlot < handle
                 for ii = 1:numel(obj.ax)
                     obj.vLines(ii) = xline(obj.ax(ii), 0, 'r--');
                 end
+
+                % info bar at the bottom showing the time at the guide position
+                obj.infoPanel = uipanel('Parent', obj.f, 'Units', 'pixels', ...
+                    'Position', [0 0 obj.f.Position(3) obj.infoPanelHeight]);
+                obj.hTextInfo = uicontrol( ...
+                    'Style',            'text', ...
+                    'Parent',           obj.infoPanel, ...
+                    'Units',            'pixels', ...
+                    'Position',         [10 0 300 obj.infoPanelHeight], ...
+                    'HorizontalAlignment', 'left', ...
+                    'FontUnits',        'normalized', ...
+                    'FontSize',         0.8, ...
+                    'String',           sprintf(['t = ' obj.timeFormatStr], 0));
               end
             end
 
-            if opt.stacked
-                % vertical stacking is defined in guiResize
-                set(obj.f, 'ResizeFcn', @obj.guiResize)
-                obj.guiResize()
-            end
+            % axis positions are recomputed on every resize and whenever a
+            % waveform is shown/hidden, for both the stacked and the grid
+            % layout
+            set(obj.f, 'ResizeFcn', @obj.relayout)
+            obj.createControlPanel();
+            obj.relayout();
 
             if ~opt.hide
                 set(obj.f, 'Visible', 'on')
@@ -361,27 +435,271 @@ classdef SeqPlot < handle
             end
         end
 
-        function guiResize(obj, ~, ~)
-            % guiResize()
-            %   Is called whenever the figure-shape is changed and makes
-            %   sure all UI elements are correctly psotitioned. This
-            %   function implements a vertical stacking of the individual
-            %   axes.
+        function relayout(obj, ~, ~)
+            % relayout()
+            %   Is called whenever the figure shape changes, and whenever
+            %   a waveform is shown/hidden via the control panel.
+            %   Repositions the control/info panels and positions all
+            %   visible axes so that they fill the available space,
+            %   collapsing any hidden ones. In 'stacked' mode all axes
+            %   share one column (in their original top-to-bottom order);
+            %   otherwise they are arranged in the original two columns
+            %   (ADC/lbl/trig, RF mag, RF/ADC ph | Gx, Gy, Gz).
 
-            nAxes = numel(obj.ax);
             width  = obj.f.Position(3);
             height = obj.f.Position(4);
 
-            axHeight = (height - (nAxes-1)*obj.margin - obj.my1) / nAxes;
-            axWidth = width - obj.mx1 - obj.mx2;
+            if ~isempty(obj.controlPanel) && isvalid(obj.controlPanel)
+                set(obj.controlPanel, 'Position', [0 height-obj.controlPanelHeight width obj.controlPanelHeight]);
+            end
+            if ~isempty(obj.infoPanel) && isvalid(obj.infoPanel)
+                set(obj.infoPanel, 'Position', [0 0 width obj.infoPanelHeight]);
+                bottomExtra = obj.infoPanelHeight;
+            else
+                bottomExtra = 0;
+            end
 
-            for ii = 1:nAxes
-                set(obj.ax(ii), 'units', 'pixels', 'Position', [obj.mx1, height-ii*axHeight-(ii-1)*obj.margin, axWidth, axHeight])
-                if ii ~= nAxes
-                    set(obj.ax(ii), 'Xlabel', [])
-                    set(obj.ax(ii), 'XTickLabel', {})
+            if obj.stackedMode
+                columns = {1:numel(obj.ax)};
+            else
+                columns = {[1 2 3], [4 5 6]};
+            end
+
+            colWidth = width / numel(columns);
+            availHeight = height - obj.controlPanelHeight - obj.my1 - bottomExtra;
+
+            for c = 1:numel(columns)
+                colIdx = columns{c};
+                visIdx = colIdx(obj.axVisible(colIdx));
+                nVis = numel(visIdx);
+                if nVis == 0
+                    continue
+                end
+                x0 = (c-1)*colWidth + obj.mx1;
+                axWidth = colWidth - obj.mx1 - obj.mx2;
+                axHeight = (availHeight - (nVis-1)*obj.margin) / nVis;
+                for k = 1:nVis
+                    idx = visIdx(k);
+                    y0 = height - obj.controlPanelHeight - k*axHeight - (k-1)*obj.margin;
+                    set(obj.ax(idx), 'Units', 'pixels', 'Position', [x0 y0 axWidth axHeight]);
+                    if k ~= nVis
+                        set(obj.ax(idx), 'XTickLabel', {});
+                        obj.ax(idx).XLabel.String = '';
+                    else
+                        set(obj.ax(idx), 'XTickLabelMode', 'auto');
+                        obj.ax(idx).XLabel.String = obj.xLabelStr;
+                    end
                 end
             end
+        end
+
+        function createControlPanel(obj)
+            % createControlPanel()
+            %   Builds a row of regular push/toggle buttons at the top of
+            %   the figure for zoom/pan, per-waveform show/hide, and a
+            %   reset-zoom button. Plain uicontrol buttons (rather than a
+            %   MATLAB toolbar) are used so the full waveform name fits
+            %   as text on the button instead of a tiny icon.
+
+            width = obj.f.Position(3);
+            height = obj.f.Position(4);
+            obj.controlPanel = uipanel('Parent', obj.f, 'Units', 'pixels', ...
+                'Position', [0 height-obj.controlPanelHeight width obj.controlPanelHeight], ...
+                'BorderType', 'none');
+
+            x = 4;
+            h = obj.controlPanelHeight - 6;
+            y = 3;
+            gap = 4;
+
+            [obj.zoomButton, x] = obj.addButton('Zoom', x, y, h, gap, @(src,~) obj.onToggleZoom(src));
+            [obj.panButton, x]  = obj.addButton('Pan',  x, y, h, gap, @(src,~) obj.onTogglePan(src));
+            [~, x] = obj.addButton(char(8962), x, y, h, gap, @(src,~) obj.onResetView(src), 'pushbutton');
+
+            x = x + 3*gap;
+            obj.waveformButtons = gobjects(1, numel(obj.labels));
+            for i = 1:numel(obj.labels)
+                [obj.waveformButtons(i), x] = obj.addButton(obj.stripBrackets(obj.labels{i}), x, y, h, gap, ...
+                    @(src,~) obj.onToggleWaveform(i, src));
+                set(obj.waveformButtons(i), 'Value', 1);
+            end
+
+            x = x + 3*gap;
+            [obj.linkGradButton, x] = obj.addButton('Link Grad Y', x, y, h, gap, ...
+                @(src,~) obj.onToggleGradYLink(src));
+            set(obj.linkGradButton, 'Value', obj.gradYLinked);
+        end
+
+        function str = stripBrackets(~, str)
+            % stripBrackets(str)
+            %   Removes any '(...)' groups (e.g. unit suffixes like
+            %   '(kHz/m)') and trailing whitespace, so button labels stay
+            %   short while the y-axis labels keep the full text.
+
+            str = regexprep(str, '\([^)]*\)', '');
+            str = regexprep(str, '\s+$', '');
+        end
+
+        function [btn, xNext] = addButton(obj, str, x, y, h, gap, callback, style)
+            % addButton(str, x, y, h, gap, callback, style)
+            %   Creates a uicontrol button (togglebutton by default) sized
+            %   to fit str, placed at (x,y) in obj.controlPanel, and
+            %   returns the x-position for the next button.
+
+            if nargin < 8
+                style = 'togglebutton';
+            end
+            w = max(40, 7*numel(str) + 16);
+            btn = uicontrol('Parent', obj.controlPanel, 'Style', style, ...
+                'String', str, 'Units', 'pixels', 'Position', [x y w h], ...
+                'Callback', callback);
+            xNext = x + w + gap;
+        end
+
+        function onToggleWaveform(obj, idx, src)
+            % onToggleWaveform(idx, src)
+            %   Callback for the per-waveform show/hide buttons. Shows/
+            %   hides axis idx and triggers a relayout.
+
+            tf = logical(src.Value);
+            obj.axVisible(idx) = tf;
+            obj.setAxisVisible(idx, tf);
+            obj.relayout();
+            obj.removeFocus(src);
+        end
+
+        function removeFocus(~, src)
+            % removeFocus(src)
+            %   Clears the keyboard-focus highlight ring left on a button
+            %   after a click, by briefly disabling and re-enabling it
+            %   (a common uicontrol trick). Without this the focus ring
+            %   competes visually with the toggle's own pressed/released
+            %   look, making it hard to tell whether a button is toggled.
+
+            set(src, 'Enable', 'off');
+            drawnow;
+            set(src, 'Enable', 'on');
+        end
+
+        function setAxisVisible(obj, idx, tf)
+            % setAxisVisible(idx, tf)
+            %   Shows/hides axis idx together with its plotted content
+            %   (axes 'Visible' alone does not affect line/legend
+            %   objects).
+
+            if tf, onoff = 'on'; else, onoff = 'off'; end
+            set(obj.ax(idx), 'Visible', onoff);
+            set(allchild(obj.ax(idx)), 'Visible', onoff);
+            lgd = get(obj.ax(idx), 'Legend');
+            if ~isempty(lgd) && isvalid(lgd)
+                set(lgd, 'Visible', onoff);
+            end
+        end
+
+        function onResetView(obj, src)
+            % onResetView()
+            %   Callback for the reset (home) button. Restores the x-axis
+            %   limits to the initial range (axes are linked on x, so
+            %   setting one propagates to all of them) and restores the
+            %   y-axis limits: each axis to its own initial range, except
+            %   Gx/Gy/Gz which reset to the shared common range if the
+            %   "Link Grad Y" mode is currently active.
+
+            xlim(obj.ax(1), obj.initialXLim);
+            obj.syncingGradYLim = true;
+            for ii = 1:numel(obj.ax)
+                if obj.gradYLinked && any(ii == obj.gradAxIdx)
+                    ylim(obj.ax(ii), obj.commonGradYLim());
+                else
+                    ylim(obj.ax(ii), obj.initialYLim(ii,:));
+                end
+            end
+            obj.syncingGradYLim = false;
+            if nargin > 1
+                obj.removeFocus(src);
+            end
+        end
+
+        function lim = commonGradYLim(obj)
+            % commonGradYLim()
+            %   The shared y-range used when Gx/Gy/Gz are linked: the
+            %   widest span across their individual initial ranges, so
+            %   nothing gets clipped once they share one scale.
+
+            gradRows = obj.initialYLim(obj.gradAxIdx, :);
+            lim = [min(gradRows(:,1)), max(gradRows(:,2))];
+        end
+
+        function onToggleGradYLink(obj, src)
+            % onToggleGradYLink(src)
+            %   Callback for the "Link Grad Y" button. When switched on,
+            %   Gx/Gy/Gz immediately snap to one shared y-range (the
+            %   widest of their individual initial ranges) and further
+            %   y-zooming on any of them is mirrored on the other two via
+            %   onGradYLimChanged. When switched off, each snaps back to
+            %   its own initial range and zooming becomes independent
+            %   again.
+
+            obj.gradYLinked = logical(src.Value);
+            obj.syncingGradYLim = true;
+            if obj.gradYLinked
+                commonLim = obj.commonGradYLim();
+                for idx = obj.gradAxIdx
+                    ylim(obj.ax(idx), commonLim);
+                end
+            else
+                for idx = obj.gradAxIdx
+                    ylim(obj.ax(idx), obj.initialYLim(idx,:));
+                end
+            end
+            obj.syncingGradYLim = false;
+            obj.removeFocus(src);
+        end
+
+        function onGradYLimChanged(obj, changedIdx)
+            % onGradYLimChanged(changedIdx)
+            %   YLim PostSet listener callback for one of Gx/Gy/Gz. While
+            %   linked, mirrors the new range onto the other two axes; the
+            %   syncingGradYLim guard prevents this from re-triggering
+            %   itself as it sets those axes' YLim in turn.
+
+            if ~obj.gradYLinked || obj.syncingGradYLim
+                return;
+            end
+            newLim = ylim(obj.ax(changedIdx));
+            obj.syncingGradYLim = true;
+            for idx = obj.gradAxIdx(obj.gradAxIdx ~= changedIdx)
+                ylim(obj.ax(idx), newLim);
+            end
+            obj.syncingGradYLim = false;
+        end
+
+        function onToggleZoom(obj, src)
+            % onToggleZoom(src)
+            %   Callback for the Zoom button. Zoom and pan are mutually
+            %   exclusive, so enabling one releases the other's button.
+
+            if logical(src.Value)
+                zoom(obj.f, 'on');
+                set(obj.panButton, 'Value', 0);
+            else
+                zoom(obj.f, 'off');
+            end
+            obj.removeFocus(src);
+        end
+
+        function onTogglePan(obj, src)
+            % onTogglePan(src)
+            %   Callback for the Pan button. See onToggleZoom for the
+            %   mutual-exclusion note.
+
+            if logical(src.Value)
+                pan(obj.f, 'on');
+                set(obj.zoomButton, 'Value', 0);
+            else
+                pan(obj.f, 'off');
+            end
+            obj.removeFocus(src);
         end
 
         function out=DataTipHandler(obj, tfactor, timeFormat, src, event)
@@ -443,10 +761,13 @@ classdef SeqPlot < handle
         function updateGuides(obj, tPos)
             % updateGuides(tPos)
             %   updates the time-position for all vertical line objects in
-            %   all axes
+            %   all axes, and the time shown in the bottom info bar
 
             for ii = 1:numel(obj.vLines)
                 set(obj.vLines(ii), 'Value', tPos);
+            end
+            if ~isempty(obj.hTextInfo) && isvalid(obj.hTextInfo)
+                obj.hTextInfo.String = sprintf(['t = ' obj.timeFormatStr], tPos);
             end
         end
     end
