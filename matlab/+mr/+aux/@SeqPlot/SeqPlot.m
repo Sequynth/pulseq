@@ -26,6 +26,11 @@ classdef SeqPlot < handle
     %   the data cursor to help verifying event alignment. Accepts a
     %   numeric or a boolean parameter.
     %
+    %   plot(...,'showLimits',1) Plot the system limits (maxGrad on the
+    %   Gx/Gy/Gz axes and maxB1 on the RF magnitude axis) as dashed red
+    %   reference lines. Accepts a numeric or a boolean parameter,
+    %   defaults to true; set to 0 to hide the limit lines.
+    %
     %   f=plot(...) Return the new figure handle.
     %
 
@@ -103,6 +108,7 @@ classdef SeqPlot < handle
                 parser.addParamValue('hide',false);%,@(x)(isstr(x)));%@(x) any(validatestring(x,validLabel))
                 parser.addParamValue('stacked',false);%,@(x)(isstr(x)));%@(x) any(validatestring(x,validLabel))
                 parser.addParamValue('showGuides',true);%,@(x)(isstr(x)));%@(x) any(validatestring(x,validLabel))
+                parser.addParamValue('showLimits',true,@(x)(isnumeric(x) || islogical(x)));
             end
             parse(parser,varargin{:});
             opt = parser.Results;
@@ -374,6 +380,31 @@ classdef SeqPlot < handle
             obj.initialYLim = zeros(numel(obj.ax), 2);
             for ii = 1:numel(obj.ax)
                 obj.initialYLim(ii,:) = ylim(obj.ax(ii));
+            end
+
+            % plot the system limits as dashed red reference lines: maxB1
+            % on the RF magnitude axis and maxGrad on the Gx/Gy/Gz axes.
+            % These are created only now, after the y-limits have been
+            % fixed (YLimMode is 'manual' at this point), so that the
+            % reference lines do not expand the axes to the limit values.
+            % They are drawn at twice the default line width and half
+            % opacity.
+            if opt.showLimits
+                if mr.aux.isOctave()
+                    warning('Option showLimits is not (yet) supported by Octave');
+                else
+                    limLineWidth = 2*get(groot,'DefaultLineLineWidth'); % twice the usual waveform line width
+                    maxB1Plot   = seq.sys.maxB1;        % Hz, matches the RF mag axis
+                    maxGradPlot = 1e-3*seq.sys.maxGrad; % Hz/m -> kHz/m, matches the gradient axes
+                    % RF magnitude limit (axis 2)
+                    yline(obj.ax(2),  maxB1Plot, '--', 'Color',[1 0 0], 'Alpha',0.5, 'LineWidth',limLineWidth);
+                    yline(obj.ax(2), -maxB1Plot, '--', 'Color',[1 0 0], 'Alpha',0.5, 'LineWidth',limLineWidth);
+                    % gradient limits (axes 4,5,6 = Gx,Gy,Gz)
+                    for j=1:3
+                        yline(obj.ax(3+j),  maxGradPlot, '--', 'Color',[1 0 0], 'Alpha',0.5, 'LineWidth',limLineWidth);
+                        yline(obj.ax(3+j), -maxGradPlot, '--', 'Color',[1 0 0], 'Alpha',0.5, 'LineWidth',limLineWidth);
+                    end
+                end
             end
 
             % Gx/Gy/Gz start out independently scaled (each to its own
