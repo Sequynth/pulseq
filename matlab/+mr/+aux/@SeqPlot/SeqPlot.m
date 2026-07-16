@@ -31,6 +31,13 @@ classdef SeqPlot < handle
     %   reference lines. Accepts a numeric or a boolean parameter,
     %   defaults to true; set to 0 to hide the limit lines.
     %
+    %   plot(...,'showSlew',1) Additionally plot the slew rate of each
+    %   gradient channel (in kHz/m/ms) as a stairstep plot on its own
+    %   axis directly below the corresponding gradient axis. With
+    %   'showLimits' enabled, maxSlew is shown as dashed red reference
+    %   lines. Accepts a numeric or a boolean parameter, defaults to
+    %   false.
+    %
     %   Press and drag the middle mouse button (or shift+left-click-drag)
     %   anywhere in the figure to pan (left/right motion) and zoom
     %   (up/down motion, drag up = zoom in) the visible time range; y-axis
@@ -52,6 +59,9 @@ classdef SeqPlot < handle
         labels          % cell array of waveform names, one per axis
         axVisible       % logical vector, current visibility of each axis
         stackedMode     % logical, whether the stacked layout is active
+        slewAxIdx       % indices into obj.ax of the SRx/SRy/SRz axes (7:9), [] when 'showSlew' is off
+        axColumns       % cell array of axis-index vectors, one per column of the (non-stacked) grid layout, top-to-bottom order within each
+        axStackOrder    % axis indices in top-to-bottom order for the stacked layout
         xLabelStr       % x-axis label string, e.g. 't (ms)'
         initialXLim     % initial x-axis limits, used to reset the zoom
         initialYLim     % initial y-axis limits per axis (Nx2), used to reset the zoom
@@ -136,6 +146,7 @@ classdef SeqPlot < handle
                 parser.addParamValue('stacked',false);%,@(x)(isstr(x)));%@(x) any(validatestring(x,validLabel))
                 parser.addParamValue('showGuides',true);%,@(x)(isstr(x)));%@(x) any(validatestring(x,validLabel))
                 parser.addParamValue('showLimits',true,@(x)(isnumeric(x) || islogical(x)));
+                parser.addParamValue('showSlew',false,@(x)(isnumeric(x) || islogical(x)));
             end
             parse(parser,varargin{:});
             opt = parser.Results;
@@ -158,13 +169,31 @@ classdef SeqPlot < handle
 
             set(obj.f, 'Visible', 'off')
 
+            % with 'showSlew' three more axes (SRx/SRy/SRz) are created;
+            % the subplot grid shape is irrelevant (relayout() below
+            % repositions everything), it only provides the axes
+            showSlew = logical(opt.showSlew);
+            nAx = 6 + 3*showSlew;
+            nCols = nAx/3;
             if ~mr.aux.isOctave()
-              obj.ax = gobjects(1,6);
+              obj.ax = gobjects(1,nAx);
             end
-            for i=1:6
-                obj.ax(i)=subplot(3,2,i);
+            for i=1:nAx
+                obj.ax(i)=subplot(3,nCols,i);
             end
-            obj.ax=obj.ax([1 3 5 2 4 6]);   % Re-order axes
+            % Re-order axes column-major (equals [1 3 5 2 4 6] for nAx==6)
+            obj.ax=obj.ax(reshape(reshape(1:nAx,nCols,3).',1,[]));
+            if showSlew
+                obj.slewAxIdx = 7:9;
+                % each SR axis sits directly below its gradient axis, so
+                % the shared time axis stays vertically aligned
+                obj.axColumns = {[1 2 3], [4 7 5 8 6 9]};
+                obj.axStackOrder = [1 2 3 4 7 5 8 6 9];
+            else
+                obj.slewAxIdx = [];
+                obj.axColumns = {[1 2 3], [4 5 6]};
+                obj.axStackOrder = 1:6;
+            end
             arrayfun(@(x)hold(x,'on'),obj.ax);
             arrayfun(@(x)grid(x,'on'),obj.ax);
             % Link the x-axes now, while the axes are still empty. Calling
@@ -182,7 +211,10 @@ classdef SeqPlot < handle
             linkaxes(obj.ax(:),'x')
             set(obj.ax, 'YLimMode', 'auto');
             obj.labels={'ADC/lbl/trig','RF mag (Hz)','RF/ADC ph (rad)','Gx (kHz/m)','Gy (kHz/m)','Gz (kHz/m)'};
-            arrayfun(@(x)ylabel(obj.ax(x),obj.labels{x}),1:6);
+            if showSlew
+                obj.labels=[obj.labels {'SRx (kHz/m/ms)','SRy (kHz/m/ms)','SRz (kHz/m/ms)'}];
+            end
+            arrayfun(@(x)ylabel(obj.ax(x),obj.labels{x}),1:numel(obj.labels));
             if ~mr.aux.isOctave()
                 % hide the per-axes interactive toolbar; the custom
                 % control panel provides zoom/pan/show-hide instead
@@ -243,7 +275,7 @@ classdef SeqPlot < handle
             % block timings
             blockEdgesInRange=blockEdges(logical((blockEdges>=timeRange(1)).*(blockEdges<=timeRange(2))));
             if strcmp(opt.timeDisp,'us') && ~mr.aux.isOctave()
-                for i=1:6
+                for i=1:numel(obj.ax)
                     xax=get(obj.ax(i),'XAxis');
                     xax.ExponentMode='manual';
                     xax.Exponent=0;
@@ -251,7 +283,7 @@ classdef SeqPlot < handle
             end
             if opt.showBlocks
                 % show block edges in plots
-                for i=1:6
+                for i=1:numel(obj.ax)
                     xax=get(obj.ax(i),'XAxis');
                     xax.TickValues=unique(tFactor.*blockEdgesInRange);
                     set(obj.ax(i),'XTickLabelRotation',90);
@@ -405,6 +437,25 @@ classdef SeqPlot < handle
                                 waveform=1e-3*grad.amplitude*[0 0 1 1 0];
                             end
                             plot(tFactor*(t0+t),waveform,'Parent',obj.ax(3+j));
+                            if showSlew && numel(t) > 1
+                                % slew rate between consecutive waveform
+                                % vertices, plotted as a stairstep since
+                                % it is piecewise-constant between them;
+                                % zero-duration segments (e.g. trapezoids
+                                % with delay==0 or flatTime==0) are
+                                % dropped to avoid 0/0. waveform is in
+                                % kHz/m and t in s, so the extra 1e-3
+                                % yields kHz/m/ms. The last value is
+                                % repeated so the final step spans to the
+                                % end of the event.
+                                tv=t(:); dt=diff(tv); dw=diff(waveform(:));
+                                keep=dt>0;
+                                if any(keep)
+                                    sr=1e-3*dw(keep)./dt(keep);
+                                    ts=tv([keep; true]);
+                                    stairs(tFactor*(t0+ts),[sr; sr(end)],'Parent',obj.ax(6+j));
+                                end
+                            end
                         end
                     end
                 end
@@ -430,7 +481,9 @@ classdef SeqPlot < handle
                 obj.axSnapLineOfVertex = cell(1, numel(obj.ax));
                 obj.axSnapLocalIdx = cell(1, numel(obj.ax));
                 for i = 1:numel(obj.ax)
-                    lines = findobj(obj.ax(i), 'Type', 'line');
+                    % 'stair' covers the slew-rate stairstep plots, which
+                    % are Stair (not Line) objects
+                    lines = findobj(obj.ax(i), 'Type', 'line', '-or', 'Type', 'stair');
                     nL = numel(lines);
                     xdc = cell(1, nL);
                     lov = cell(1, nL);
@@ -512,6 +565,14 @@ classdef SeqPlot < handle
                         yline(obj.ax(3+j),  maxGradPlot, '--', 'Color',[1 0 0], 'Alpha',0.5, 'LineWidth',limLineWidth);
                         yline(obj.ax(3+j), -maxGradPlot, '--', 'Color',[1 0 0], 'Alpha',0.5, 'LineWidth',limLineWidth);
                     end
+                    % slew-rate limits (axes 7,8,9 = SRx,SRy,SRz), if present
+                    if ~isempty(obj.slewAxIdx)
+                        maxSlewPlot = 1e-6*seq.sys.maxSlew; % Hz/m/s -> kHz/m/ms, matches the slew axes
+                        for idx=obj.slewAxIdx
+                            yline(obj.ax(idx),  maxSlewPlot, '--', 'Color',[1 0 0], 'Alpha',0.5, 'LineWidth',limLineWidth);
+                            yline(obj.ax(idx), -maxSlewPlot, '--', 'Color',[1 0 0], 'Alpha',0.5, 'LineWidth',limLineWidth);
+                        end
+                    end
                 end
             end
 
@@ -581,9 +642,11 @@ classdef SeqPlot < handle
             %   Repositions the control/info panels and positions all
             %   visible axes so that they fill the available space,
             %   collapsing any hidden ones. In 'stacked' mode all axes
-            %   share one column (in their original top-to-bottom order);
-            %   otherwise they are arranged in the original two columns
-            %   (ADC/lbl/trig, RF mag, RF/ADC ph | Gx, Gy, Gz).
+            %   share one column (in axStackOrder); otherwise they are
+            %   arranged in the two columns given by axColumns
+            %   (ADC/lbl/trig, RF mag, RF/ADC ph | Gx, Gy, Gz, with each
+            %   slew-rate axis interleaved directly below its gradient
+            %   when 'showSlew' is active).
 
             width  = obj.f.Position(3);
             height = obj.f.Position(4);
@@ -599,9 +662,9 @@ classdef SeqPlot < handle
             end
 
             if obj.stackedMode
-                columns = {1:numel(obj.ax)};
+                columns = {obj.axStackOrder};
             else
-                columns = {[1 2 3], [4 5 6]};
+                columns = obj.axColumns;
             end
 
             colWidth = width / numel(columns);
@@ -989,13 +1052,19 @@ classdef SeqPlot < handle
             if strcmp(at(1:3),'adc') || ...
                (strcmp(at(1:6),'rf/adc') && strcmp(target.LineStyle,'none') && strcmp(target.Marker,'.')) % we need to check whether we are dealing with the ADC phase, which is also shown in the same panel as the RF
                 field='adc';
+            elseif strcmp(at(1:2),'sr')
+                % slew-rate axes: the data belongs to the gradient event
+                % of the corresponding channel (srx -> gx etc.)
+                field=['g' at(3)];
             else
                 field=at(1:2);
             end
             % create the custom data tip as tex-formatted cell array of lines
             t0=t;
-            if isa(target,'matlab.graphics.chart.primitive.Line')
-                % for trapezoid gradients the last point may belong to the next block
+            if isa(target,'matlab.graphics.chart.primitive.Line') || ...
+               isa(target,'matlab.graphics.chart.primitive.Stair')
+                % for trapezoid gradients (and their slew-rate stairs)
+                % the last point may belong to the next block
                 t0=target.XData(1);
             end
             iB=obj.hSeq.findBlockByTime(t0/obj.tFactor);
