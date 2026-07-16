@@ -31,6 +31,11 @@ classdef SeqPlot < handle
     %   reference lines. Accepts a numeric or a boolean parameter,
     %   defaults to true; set to 0 to hide the limit lines.
     %
+    %   Press and drag the middle mouse button (or shift+left-click-drag)
+    %   anywhere in the figure to pan (left/right motion) and zoom
+    %   (up/down motion, drag up = zoom in) the visible time range; y-axis
+    %   scales are never affected by this gesture.
+    %
     %   f=plot(...) Return the new figure handle.
     %
 
@@ -62,6 +67,19 @@ classdef SeqPlot < handle
         gradYListeners  % cell array of YLim PostSet listeners for Gx/Gy/Gz
         syncingGradYLim % re-entrancy guard while propagating a linked y-zoom
 
+        mmbActive         % logical, true while a middle-button drag is in progress
+        mmbStartPointPix  % [x y] figure CurrentPoint (pixels) at the previous motion event; advanced each frame
+        mmbRefAxIdx       % index into obj.ax of the reference axis used for this drag
+        mmbRefAxWidthPix  % pixel width of the reference axis at drag start
+        mmbRefAxHeightPix % pixel height of the reference axis at drag start
+
+        tFactor            % numeric time-unit scale factor (e.g. 1e3 for ms), converts plotted (scaled) times back to raw seconds
+        axSnapX            % cell array (1xnumel(ax)), x (time) value of every plotted-line vertex in each axis, for snapping the guide/data-tip to actual waveform points
+        axSnapLines        % cell array (1xnumel(ax)), the (few) line handles per axis
+        axSnapLineOfVertex % cell array (1xnumel(ax)), index into axSnapLines{i} of the line owning each axSnapX entry
+        axSnapLocalIdx     % cell array (1xnumel(ax)), index of each axSnapX entry within its own line's XData/YData
+        hDataTipBox        % annotation textbox used as the manual hover data-tip popup
+
         infoPanel       % uipanel at the bottom showing the guide time
         hTextInfo       % text uicontrol inside infoPanel
 
@@ -85,6 +103,15 @@ classdef SeqPlot < handle
 
         % indices into obj.ax of the Gx/Gy/Gz gradient axes
         gradAxIdx = [4 5 6];
+
+        % gain for middle-button-drag vertical zoom: a full-axis-height
+        % drag changes the time range width by a factor of 2^mmbZoomGain
+        mmbZoomGain = 4;
+
+        % pixel distance (in x, within the hovered axis) inside which a
+        % nearby waveform point is considered "hovered" and shows the
+        % data-tip popup
+        dataTipPixelThresh = 15;
 
     end
 
@@ -140,6 +167,20 @@ classdef SeqPlot < handle
             obj.ax=obj.ax([1 3 5 2 4 6]);   % Re-order axes
             arrayfun(@(x)hold(x,'on'),obj.ax);
             arrayfun(@(x)grid(x,'on'),obj.ax);
+            % Link the x-axes now, while the axes are still empty. Calling
+            % linkaxes on already-populated axes forces an expensive
+            % limit-reconcile / render pass over every plotted point
+            % (~0.4s extra for large sequences); doing it up front avoids
+            % that. The real display range is applied with an explicit
+            % xlim(dispRange) after all data has been plotted below.
+            % linkaxes sets BOTH XLimMode and YLimMode to 'manual'; the
+            % x-link needs the manual XLimMode, but YLimMode must be put
+            % back to 'auto' so the y-axes still auto-scale to the data as
+            % it is plotted (otherwise they stay frozen at the default
+            % [0 1]). Per-axis y-limits are finalised explicitly further
+            % below.
+            linkaxes(obj.ax(:),'x')
+            set(obj.ax, 'YLimMode', 'auto');
             obj.labels={'ADC/lbl/trig','RF mag (Hz)','RF/ADC ph (rad)','Gx (kHz/m)','Gy (kHz/m)','Gz (kHz/m)'};
             arrayfun(@(x)ylabel(obj.ax(x),obj.labels{x}),1:6);
             if ~mr.aux.isOctave()
@@ -150,6 +191,7 @@ classdef SeqPlot < handle
 
             tFactorList = [1 1e3 1e6];
             tFactor = tFactorList(strcmp(opt.timeDisp,validTimeUnits));
+            obj.tFactor = tFactor;
             obj.xLabelStr = ['t (' opt.timeDisp ')'];
 
             t0=0;
@@ -186,7 +228,7 @@ classdef SeqPlot < handle
             % data cursor callback
             if ~mr.aux.isOctave()
               hDCM = datacursormode(obj.f);
-              hDCM.UpdateFcn = @(src, event)DataTipHandler(obj,tFactor,[timeFormat ' ' opt.timeDisp],src,event);
+              hDCM.UpdateFcn = @(src, event)DataTipHandler(obj,src,event);
             end
 
             % time/block range
@@ -224,22 +266,19 @@ classdef SeqPlot < handle
             %
             gradChannels={'gx','gy','gz'};
 
-            % loop through blocks
+            % loop through blocks. Blocks entirely before the display
+            % range are unpacked (getBlock) only when label plotting was
+            % requested, since the label counters accumulate from the
+            % first block onwards; once past the range end nothing can
+            % contribute anymore, so the loop stops early.
+            needLabels = ~isempty(label_indexes_2plot);
             for iB=1:length(seq.blockEvents)
-                block = seq.getBlock(iB);
-                if isfield(block,'rotation')
-                    % apply the rotation to the current block and restore the block structure
-                    c=mr.rotate3D(block.rotation.rotQuaternion,block,'system',seq.sys);
-                    for i=1:3
-                        block.(gradChannels{i})=[];
-                    end
-                    for i=1:length(c)
-                        if isstruct(c{i}) && isfield(c{i},'type') && isfield(c{i},'channel')
-                            block.(['g' c{i}.channel])=c{i};
-                        end
-                    end
+                if t0 > timeRange(2)
+                    break;
                 end
-                if t0<=timeRange(2)
+                isValid = t0+seq.blockDurations(iB)>timeRange(1);
+                if isValid || needLabels
+                    block = seq.getBlock(iB);
                     % update the labels / counters even if we are below the display range
                     if isfield(block,'label') %current labels, works on the curent or next adc
                         for i=1:length(block.label)
@@ -253,30 +292,41 @@ classdef SeqPlot < handle
                         label_defined=true;
                     end
                 end
-                isValid = t0+seq.blockDurations(iB)>timeRange(1) && t0<=timeRange(2);
                 if isValid
+                    if isfield(block,'rotation')
+                        % apply the rotation to the current block and restore the block structure
+                        c=mr.rotate3D(block.rotation.rotQuaternion,block,'system',seq.sys);
+                        for i=1:3
+                            block.(gradChannels{i})=[];
+                        end
+                        for i=1:length(c)
+                            if isstruct(c{i}) && isfield(c{i},'type') && isfield(c{i},'channel')
+                                block.(['g' c{i}.channel])=c{i};
+                            end
+                        end
+                    end
                     if isfield(block,'trig') && ~isempty(block.trig)
                         switch(block.trig.type)
                             case 'output'
                                 % plot digital output triggers in the RF-TX pane
-                                p2x=plot(tFactor*(t0+block.trig.delay),0,'diamond','Color',[0 0.5 0],'Parent',obj.ax(1));
-                                p2x=plot(tFactor*(t0+block.trig.delay +[0 block.trig.duration]),[0 0],'-','Marker','.','Color',[0 0.5 0],'Parent',obj.ax(1));
+                                plot(tFactor*(t0+block.trig.delay),0,'diamond','Color',[0 0.5 0],'Parent',obj.ax(1));
+                                plot(tFactor*(t0+block.trig.delay +[0 block.trig.duration]),[0 0],'-','Marker','.','Color',[0 0.5 0],'Parent',obj.ax(1));
                             case 'trigger'
-                                p1x=plot(tFactor*(t0+block.trig.delay),0,'>b','Parent',obj.ax(1));
-                                p1x=plot(tFactor*(t0+block.trig.delay),0,'.b','Parent',obj.ax(1));
+                                plot(tFactor*(t0+block.trig.delay),0,'>b','Parent',obj.ax(1));
+                                plot(tFactor*(t0+block.trig.delay),0,'.b','Parent',obj.ax(1));
                             %otherwise
                         end
                     end
                     if ~isempty(block.adc)
                         adc=block.adc;
                         t=adc.delay + ((0:adc.numSamples-1)'+0.5)*adc.dwell; % according to the information from Klaus Scheffler and indirectly from Siemens this is the present convention (the samples are shifted by 0.5 dwell)
-                        p1=plot(tFactor*(t0+t),zeros(size(t)),'rx','Parent',obj.ax(1));
+                        plot(tFactor*(t0+t),zeros(size(t)),'rx','Parent',obj.ax(1));
                         if isempty(adc.phaseModulation)
                             adc.phaseModulation=0;
                         end
                         full_freqOffset=adc.freqOffset+adc.freqPPM*1e-6*seq.sys.gamma*seq.sys.B0;
                         full_phaseOffset=adc.phaseOffset+adc.phasePPM*1e-6*seq.sys.gamma*seq.sys.B0;
-                        p2=plot(tFactor*(t0+t), angle(exp(1i*(full_phaseOffset+adc.phaseModulation)).*exp(1i*2*pi*t*full_freqOffset)),'b.','MarkerSize',1,'Parent',obj.ax(3)); % plot ADC phase
+                        plot(tFactor*(t0+t), angle(exp(1i*(full_phaseOffset+adc.phaseModulation)).*exp(1i*2*pi*t*full_freqOffset)),'b.','MarkerSize',1,'Parent',obj.ax(3)); % plot ADC phase
                         % labels/counters/flags
                         if label_defined && ~isempty(label_indexes_2plot)
                             set(obj.ax(1),'ColorOrder',label_colors_2plot);
@@ -333,11 +383,11 @@ classdef SeqPlot < handle
                         end
 
                         if (sreal)
-                            p1=plot(tFactor*(t0+t+rf.delay),  real(s),'Parent',obj.ax(2));
-                            p2=plot(tFactor*(t0+t+rf.delay),  angle(s.*sign(real(s))*exp(1i*full_phaseOffset).*exp(1i*2*pi*t    *full_freqOffset)), tFactor*(t0+tc+rf.delay), angle(sc*exp(1i*full_phaseOffset).*exp(1i*2*pi*tc*full_freqOffset)),'xb', 'Parent',obj.ax(3));
+                            plot(tFactor*(t0+t+rf.delay),  real(s),'Parent',obj.ax(2));
+                            plot(tFactor*(t0+t+rf.delay),  angle(s.*sign(real(s))*exp(1i*full_phaseOffset).*exp(1i*2*pi*t    *full_freqOffset)), tFactor*(t0+tc+rf.delay), angle(sc*exp(1i*full_phaseOffset).*exp(1i*2*pi*tc*full_freqOffset)),'xb', 'Parent',obj.ax(3));
                         else
-                            p1=plot(tFactor*(t0+t+rf.delay),  abs(s),'Parent',obj.ax(2));
-                            p2=plot(tFactor*(t0+t+rf.delay),  angle(s*exp(1i*full_phaseOffset).*exp(1i*2*pi*t    *full_freqOffset)), tFactor*(t0+tc+rf.delay), angle(sc*exp(1i*full_phaseOffset).*exp(1i*2*pi*tc*full_freqOffset)),'xb', 'Parent',obj.ax(3));
+                            plot(tFactor*(t0+t+rf.delay),  abs(s),'Parent',obj.ax(2));
+                            plot(tFactor*(t0+t+rf.delay),  angle(s*exp(1i*full_phaseOffset).*exp(1i*2*pi*t    *full_freqOffset)), tFactor*(t0+tc+rf.delay), angle(sc*exp(1i*full_phaseOffset).*exp(1i*2*pi*tc*full_freqOffset)),'xb', 'Parent',obj.ax(3));
                         end
                     end
                     for j=1:length(gradChannels)
@@ -354,24 +404,82 @@ classdef SeqPlot < handle
                                 t=cumsum([0 grad.delay grad.riseTime grad.flatTime grad.fallTime]);
                                 waveform=1e-3*grad.amplitude*[0 0 1 1 0];
                             end
-                            p=plot(tFactor*(t0+t),waveform,'Parent',obj.ax(3+j));
+                            plot(tFactor*(t0+t),waveform,'Parent',obj.ax(3+j));
                         end
                     end
                 end
                 t0=t0+seq.blockDurations(iB);%mr.calcDuration(block);
             end
 
-            % Set axis limits and zoom properties
+            % Cache, per axis, the x (time) value of every vertex of
+            % every plotted line, so findHoverPoint can snap the guides/
+            % data-tip to actual waveform time points instead of an
+            % arbitrary cursor position. To keep this cheap even for
+            % sequences with hundreds of thousands of plotted samples,
+            % everything is stored as flat numeric arrays (never a
+            % graphics-handle array per vertex): axSnapX is the
+            % concatenated x-values, axSnapLineOfVertex maps each vertex
+            % to its line's index within the small per-axis axSnapLines
+            % handle list, and axSnapLocalIdx is the vertex's index
+            % within its own line's XData/YData. Values are collected in
+            % cells and concatenated once (O(total vertices)) rather than
+            % grown incrementally.
+            if ~mr.aux.isOctave()
+                obj.axSnapX = cell(1, numel(obj.ax));
+                obj.axSnapLines = cell(1, numel(obj.ax));
+                obj.axSnapLineOfVertex = cell(1, numel(obj.ax));
+                obj.axSnapLocalIdx = cell(1, numel(obj.ax));
+                for i = 1:numel(obj.ax)
+                    lines = findobj(obj.ax(i), 'Type', 'line');
+                    nL = numel(lines);
+                    xdc = cell(1, nL);
+                    lov = cell(1, nL);
+                    lic = cell(1, nL);
+                    for k = 1:nL
+                        xd = get(lines(k), 'XData');
+                        xdc{k} = xd;
+                        lov{k} = repmat(k, 1, numel(xd));
+                        lic{k} = 1:numel(xd);
+                    end
+                    obj.axSnapX{i} = [xdc{:}];
+                    obj.axSnapLineOfVertex{i} = [lov{:}];
+                    obj.axSnapLocalIdx{i} = [lic{:}];
+                    obj.axSnapLines{i} = lines;
+                end
+            end
+
+            % Set axis limits and zoom properties. The x-axes were
+            % already linked (above, while empty); this xlim call applies
+            % the actual display range and propagates it across the link.
             dispRange = tFactor*[timeRange(1) min(timeRange(2),t0)];
             obj.initialXLim = dispRange;
             arrayfun(@(x)xlim(x,dispRange),obj.ax);
-            linkaxes(obj.ax(:),'x')
             if ~mr.aux.isOctave()
               h = zoom(obj.f);
               setAxesZoomMotion(h,obj.ax(1),'horizontal');
               p = pan(obj.f);
               p.Motion = 'horizontal';
             end
+            if ~mr.aux.isOctave()
+                set(obj.f, 'WindowButtonDownFcn',   @obj.onMmbDown);
+                set(obj.f, 'WindowButtonMotionFcn', @obj.onMmbDrag);
+                set(obj.f, 'WindowButtonUpFcn',     @obj.onMmbUp);
+                % floating hover data-tip popup, manually driven from
+                % onMmbDrag since the custom callbacks above disable
+                % MATLAB's built-in default interactivity (and with it
+                % the automatic hover data tip) figure-wide
+                obj.hDataTipBox = annotation(obj.f, 'textbox', [0 0 0.01 0.01], 'Visible', 'off');
+                set(obj.hDataTipBox, 'Units', 'pixels', 'BackgroundColor', [1 1 0.85], ...
+                    'EdgeColor', [0.4 0.4 0.4], 'FitBoxToText', 'on', 'Interpreter', 'tex', ...
+                    'FontSize', 8, 'Margin', 3, 'HitTest', 'off', 'PickableParts', 'none');
+            end
+            obj.mmbActive = false;
+            % The y-axes are in 'auto' mode but their limits are computed
+            % lazily (only at render time); force that computation now so
+            % the padding/read-back below sees the real data ranges rather
+            % than the default [0 1]. (Previously the linkaxes call that
+            % ran here after filling triggered this implicitly.)
+            drawnow;
             % manually fix the phase vertical scale to +- pi
             ylim(obj.ax(3),[-pi pi]);
             % make Y-axes little bit less tight
@@ -713,6 +821,9 @@ classdef SeqPlot < handle
             if logical(src.Value)
                 zoom(obj.f, 'on');
                 set(obj.panButton, 'Value', 0);
+                % the mode takes over the mouse callbacks, so the tip
+                % cannot update and would sit frozen -- hide it
+                obj.hideDataTip();
             else
                 zoom(obj.f, 'off');
             end
@@ -727,13 +838,121 @@ classdef SeqPlot < handle
             if logical(src.Value)
                 pan(obj.f, 'on');
                 set(obj.zoomButton, 'Value', 0);
+                % see onToggleZoom for the hide rationale
+                obj.hideDataTip();
             else
                 pan(obj.f, 'off');
             end
             obj.removeFocus(src);
         end
 
-        function out=DataTipHandler(obj, tfactor, timeFormat, src, event)
+        function onMmbDown(obj, ~, ~)
+            % onMmbDown()
+            %   WindowButtonDownFcn for the middle-mouse-drag time
+            %   pan/zoom gesture (see onMmbDrag). Middle-click is
+            %   identified via SelectionType 'extend', MATLAB's standard
+            %   proxy for the middle button (also produced by
+            %   shift+left-click, which is accepted as an alias). Records
+            %   the mouse position and the pixel size of a reference axis
+            %   (the first visible one), used by onMmbDrag to apply an
+            %   incremental pan/zoom on every motion event.
+
+            if ~strcmp(obj.f.SelectionType, 'extend')
+                return;
+            end
+            refIdx = find(obj.axVisible, 1);
+            if isempty(refIdx)
+                return;
+            end
+            obj.mmbRefAxIdx = refIdx;
+            obj.mmbStartPointPix = obj.f.CurrentPoint;
+            pos = get(obj.ax(refIdx), 'Position'); % pixels, per relayout
+            obj.mmbRefAxWidthPix = pos(3);
+            obj.mmbRefAxHeightPix = pos(4);
+            obj.mmbActive = true;
+            % the hover data-tip is not updated while dragging (see
+            % onMmbDrag), so hide it rather than leaving it frozen
+            obj.hideDataTip();
+        end
+
+        function onMmbDrag(obj, ~, ~)
+            % onMmbDrag()
+            %   WindowButtonMotionFcn, called on every mouse move over
+            %   the figure (not just while dragging). While no drag is
+            %   active, snaps the vertical guide lines / info-bar and the
+            %   hover data-tip popup to the nearest actual waveform time
+            %   point under the cursor (via findHoverPoint) -- this
+            %   class's own custom WindowButtonDownFcn/MotionFcn/UpFcn
+            %   (needed for the middle-button drag gesture below) disable
+            %   MATLAB's built-in default interactivity figure-wide,
+            %   including the hover data tip that used to drive both of
+            %   those via DataTipHandler, so both are reimplemented here
+            %   directly instead of relying on datacursormode. During a
+            %   drag this hover work is skipped entirely: its result is
+            %   not needed then, and findHoverPoint's scan over all
+            %   plotted vertices is exactly what would make the gesture
+            %   sluggish on large sequences.
+            %
+            %   If a drag started in onMmbDown, instead pans/zooms
+            %   the time range incrementally: each motion event applies
+            %   the pixel delta since the previous event to the current
+            %   range. Horizontal motion pans so that the plotted content
+            %   follows the cursor (the standard grab-and-drag
+            %   convention, matching MATLAB's own built-in pan tool);
+            %   vertical motion zooms the range in/out (drag up = zoom
+            %   in) around the current center of the axis, so that
+            %   whatever is centered stays centered regardless of how the
+            %   range has already been panned or zoomed. Because the pan
+            %   step is scaled by the current width, a given pixel of
+            %   cursor motion always maps to the same on-screen distance,
+            %   however far the gesture has already zoomed. Only xlim is
+            %   ever touched, so y-axis scales are never affected. Since
+            %   all axes are x-linked via linkaxes, setting xlim on the
+            %   reference axis propagates to the rest.
+
+            if ~obj.mmbActive
+                [hoveredIdx, snappedT, targetLine, localIdx, distPix] = obj.findHoverPoint();
+                if ~isempty(hoveredIdx)
+                    obj.updateGuides(snappedT);
+                end
+                obj.updateDataTipFromCursor(hoveredIdx, targetLine, localIdx, distPix);
+                return;
+            end
+            cp = obj.f.CurrentPoint;
+            dxPix = cp(1) - obj.mmbStartPointPix(1);
+            dyPix = cp(2) - obj.mmbStartPointPix(2);
+            obj.mmbStartPointPix = cp; % advance reference for next event
+
+            curXLim = xlim(obj.ax(obj.mmbRefAxIdx));
+            curWidth = diff(curXLim);
+            curCenter = mean(curXLim);
+
+            factor = 2^(dyPix / obj.mmbRefAxHeightPix * obj.mmbZoomGain);
+            newWidth = curWidth / factor;
+            minWidth = 1e-4 * diff(obj.initialXLim);
+            if newWidth < minWidth
+                newWidth = minWidth;
+            end
+
+            % Zoom about the current center, then pan by this frame's
+            % horizontal cursor delta (scaled by the current width).
+            panOffset = -dxPix / obj.mmbRefAxWidthPix * newWidth;
+            newCenter = curCenter + panOffset;
+
+            newXLim = newCenter + newWidth/2*[-1 1];
+            xlim(obj.ax(obj.mmbRefAxIdx), newXLim);
+        end
+
+        function onMmbUp(obj, ~, ~)
+            % onMmbUp()
+            %   WindowButtonUpFcn that ends the middle-mouse-drag
+            %   gesture. Unconditional reset, safe to call even if a
+            %   drag was never active.
+
+            obj.mmbActive = false;
+        end
+
+        function out=DataTipHandler(obj, src, event)
             if ~isa(event,'matlab.graphics.internal.DataTipEvent') || ...
                ~isprop(event, 'Position') || length(event.Position)<2 || ...
                ~isprop(event, 'Target')
@@ -741,25 +960,48 @@ classdef SeqPlot < handle
                 return;
             end
             ax=src.Host.Parent;
+            t=event.Position(1);
+            out = obj.buildTipLines(ax, event.Target, t, event.Position(2));
+
+            % we need to delay the call of the update, otherwise the plot
+            % object generates an exception; the timer deletes itself once
+            % it has fired (timer objects are never garbage-collected)
+            tmr=timer('StartDelay',0,'TimerFcn',@(~,~)updateGuides(obj,t), ...
+                'StopFcn',@(tmrObj,~)delete(tmrObj));
+            tmr.start();
+        end
+
+        function out = buildTipLines(obj, ax, target, t, yValue)
+            % buildTipLines(ax, target, t, yValue)
+            %   Builds the tex-formatted data-tip line cell array (time,
+            %   Y value, and block/event id) for a point at time t /
+            %   value yValue on graphics object target within axis ax.
+            %   Shared by DataTipHandler (MATLAB's built-in hover data
+            %   tip, unreachable in practice since the middle-drag
+            %   gesture's custom WindowButton*Fcn callbacks disable
+            %   default interactivity figure-wide -- kept for
+            %   compatibility should that ever change) and
+            %   updateDataTipFromCursor (this class's own manual
+            %   hover-tip renderer, driven from onMmbDrag).
+
             % get the relevant target from the y-axes title
             at=lower(ax.YLabel.String);
             if strcmp(at(1:3),'adc') || ...
-               (strcmp(at(1:6),'rf/adc') && strcmp(event.Target.LineStyle,'none') && strcmp(event.Target.Marker,'.')) % we need to check whether we are dealing with the ADC phase, which is also shown in the same panel as the RF
+               (strcmp(at(1:6),'rf/adc') && strcmp(target.LineStyle,'none') && strcmp(target.Marker,'.')) % we need to check whether we are dealing with the ADC phase, which is also shown in the same panel as the RF
                 field='adc';
             else
                 field=at(1:2);
             end
             % create the custom data tip as tex-formatted cell array of lines
-            t=event.Position(1);
             t0=t;
-            if isa(event.Target,'matlab.graphics.chart.primitive.Line')
+            if isa(target,'matlab.graphics.chart.primitive.Line')
                 % for trapezoid gradients the last point may belong to the next block
-                t0=event.Target.XData(1);
+                t0=target.XData(1);
             end
-            iB=obj.hSeq.findBlockByTime(t0/tfactor);
+            iB=obj.hSeq.findBlockByTime(t0/obj.tFactor);
             rb=obj.hSeq.getRawBlockContentIDs(iB);
-            out={['\bf\color{blue}t:\rm\color{black}' sprintf(timeFormat,t)],...
-                 ['\bf\color{blue}Y:\rm\color{black}' num2str(event.Position(2))],...
+            out={['\bf\color{blue}t:\rm\color{black}' sprintf(obj.timeFormatStr,t)],...
+                 ['\bf\color{blue}Y:\rm\color{black}' num2str(yValue)],...
                  ''};
             if isempty(rb.(field))
                 out{3}=['\bf\color{blue}blk:\rm\color{black}' num2str(iB)];
@@ -782,11 +1024,6 @@ classdef SeqPlot < handle
                     out{3}=['\bf\color{blue}blk:\rm\color{black}' num2str(iB) ' \bf\color{blue}' field '\_id:\rm\color{black}' num2str(rb.(field))];
                 end
             end
-
-            % we need to delay the call of the update, otherwise the plot
-            % object generates an exception
-            t=timer('StartDelay',0e-3,'Period',1e-3,'TimerFcn',@(~,~)updateGuides(obj,t));
-            t.start();
         end
 
         function updateGuides(obj, tPos)
@@ -800,6 +1037,87 @@ classdef SeqPlot < handle
             if ~isempty(obj.hTextInfo) && isvalid(obj.hTextInfo)
                 obj.hTextInfo.String = sprintf(['t = ' obj.timeFormatStr], tPos);
             end
+        end
+
+        function [hoveredIdx, snappedT, targetLine, localIdx, distPix] = findHoverPoint(obj)
+            % findHoverPoint()
+            %   Locates the visible axis (if any) the cursor currently
+            %   sits over, and within it the nearest actual waveform
+            %   vertex to the cursor's x (time) position, using the
+            %   axSnapX/axSnapLines/axSnapLineOfVertex/axSnapLocalIdx
+            %   caches built at
+            %   construction. Returns hoveredIdx=[] if the cursor is not
+            %   over any visible axis. targetLine/localIdx are only
+            %   populated when that axis has at least one plotted vertex
+            %   to snap to; distPix is the pixel distance (in x) from the
+            %   cursor to the snapped vertex, Inf if there was none to
+            %   snap to.
+
+            hoveredIdx = [];
+            snappedT = [];
+            targetLine = gobjects(0);
+            localIdx = [];
+            distPix = Inf;
+
+            cp = obj.f.CurrentPoint;
+            for i = find(obj.axVisible)
+                pos = get(obj.ax(i), 'Position');
+                if cp(1) < pos(1) || cp(1) > pos(1)+pos(3) || cp(2) < pos(2) || cp(2) > pos(2)+pos(4)
+                    continue;
+                end
+                hoveredIdx = i;
+                xl = xlim(obj.ax(i));
+                rawT = xl(1) + (cp(1)-pos(1)) / pos(3) * diff(xl);
+                xs = obj.axSnapX{i};
+                if isempty(xs)
+                    snappedT = rawT;
+                else
+                    [dmin, k] = min(abs(xs - rawT));
+                    snappedT = xs(k);
+                    targetLine = obj.axSnapLines{i}(obj.axSnapLineOfVertex{i}(k));
+                    localIdx = obj.axSnapLocalIdx{i}(k);
+                    distPix = dmin / diff(xl) * pos(3);
+                end
+                return;
+            end
+        end
+
+        function hideDataTip(obj)
+            % hideDataTip()
+            %   Hides the floating hover data-tip popup (no-op if it was
+            %   never created, e.g. on Octave). Called when a pan/zoom
+            %   interaction starts, since the tip is not updated during
+            %   those and would otherwise sit frozen on screen.
+
+            if ~isempty(obj.hDataTipBox) && isvalid(obj.hDataTipBox)
+                set(obj.hDataTipBox, 'Visible', 'off');
+            end
+        end
+
+        function updateDataTipFromCursor(obj, hoveredIdx, targetLine, localIdx, distPix)
+            % updateDataTipFromCursor(hoveredIdx, targetLine, localIdx, distPix)
+            %   Shows/updates the floating hover data-tip popup
+            %   (obj.hDataTipBox) near the cursor when it sits within
+            %   dataTipPixelThresh pixels of the waveform vertex found by
+            %   findHoverPoint, using buildTipLines for the popup content
+            %   (the same content DataTipHandler used to build for
+            %   MATLAB's built-in hover data tip). Hides the popup
+            %   otherwise. Called from onMmbDrag on every mouse move.
+
+            if isempty(obj.hDataTipBox) || ~isvalid(obj.hDataTipBox)
+                return;
+            end
+            if isempty(hoveredIdx) || isempty(targetLine) || distPix > obj.dataTipPixelThresh
+                obj.hideDataTip();
+                return;
+            end
+            xd = get(targetLine, 'XData');
+            yd = get(targetLine, 'YData');
+            tVal = xd(localIdx);
+            yVal = yd(localIdx);
+            out = obj.buildTipLines(obj.ax(hoveredIdx), targetLine, tVal, yVal);
+            cp = obj.f.CurrentPoint;
+            set(obj.hDataTipBox, 'String', out, 'Position', [cp(1)+12, cp(2)+12, 1, 1], 'Visible', 'on');
         end
     end
 end
