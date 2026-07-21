@@ -2724,6 +2724,60 @@ classdef Sequence < handle
             end
         end
 
+        function ok=copyToRemote(seq, servername, username, localFile, remoteFolder)
+            %copyToRemote Copy the sequence to a folder on a remote host.
+            %   copyToRemote(seq,servername,remoteFolder,username) writes the
+            %   sequence to a temporary .seq file and copies it into
+            %   remoteFolder on servername via ssh/scp, logging in as
+            %   username. The remote directory is created first if it does
+            %   not exist, and the file is named after the sequence's 'Name'
+            %   definition (falling back to 'external').
+            %
+            %   Requires an OpenSSH client (ssh/scp) on the system PATH and
+            %   either an ssh-agent/key or an interactive password prompt.
+            %   Returns true if the copy succeeded.
+            %
+            %   See also install
+
+            % name the remote file after the sequence, as install() does
+            seqName = seq.getDefinition('Name');
+            if isempty(seqName)
+                seqName = 'external';
+            end
+            remoteFile = [remoteFolder '/' seqName '.seq'];
+
+            if ~isfile(localFile)
+                seq.write(localFile);
+            end
+
+            % ssh/scp options shared by both calls below. BatchMode=yes is
+            % the key one: without it, ssh/scp can silently fall back to an
+            % interactive password/passphrase/host-key prompt, which has no
+            % terminal to go to when system() runs from a non-interactive
+            % script and just hangs forever (this is why copyToRemote could
+            % "stop" even though the same commands run fine when stepped
+            % through by hand in the debugger). Same pattern as install().
+            sshOpts = '-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new';
+
+            % create the remote directory first (ssh+scp pattern following
+            % the writeBSSFP_radial copySeqToRemote helper)
+            sshCmd = sprintf('ssh %s %s@%s "mkdir -p ''%s''"', sshOpts, username, servername, remoteFolder);
+            [mkdirStatus, mkdirOut] = system(sshCmd);
+            if mkdirStatus ~= 0
+                warning('Could not create remote folder %s on %s:\n%s', remoteFolder, servername, mkdirOut);
+            end
+
+            fprintf('Copying sequence to %s@%s:%s\n', username, servername, remoteFile);
+            scpCmd = sprintf('scp %s "%s" %s@%s:"%s"', sshOpts, localFile, username, servername, remoteFile);
+            [status, cmdout] = system(scpCmd);
+            ok = status == 0;
+            if ok
+                fprintf('Copy to %s successful!\n', servername);
+            else
+                warning('Copy to %s failed!\n%s', servername, cmdout);
+            end
+        end
+
         function ok=install(seq,param1,param2)
             %install Install sequence on RANGE system.
             %   install(seq) Install sequence by copying files to Siemens
