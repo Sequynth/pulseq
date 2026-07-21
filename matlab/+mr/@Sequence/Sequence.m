@@ -1728,6 +1728,15 @@ classdef Sequence < handle
             %   the data cursor to help verifying event alignment. Accepts a
             %   numeric or a boolean parameter.
             %
+            %   plot(...,'extra',extra) Plot additional, caller-supplied
+            %   waveforms that are not derived from the seq object, each on
+            %   its own new axis appended after the built-in ones. extra is
+            %   a struct array with fields t (time in seconds), waveform,
+            %   and label (y-axis label); t/waveform may instead be cell
+            %   arrays of vectors to plot multiple traces sharing one axis,
+            %   in which case an optional name field (cell array of legend
+            %   entries) may also be given. See mr.aux.SeqPlot for details.
+            %
             %   f=plot(...) Return the new figure handle.
             %
 

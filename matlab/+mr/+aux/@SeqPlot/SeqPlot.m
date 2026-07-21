@@ -38,6 +38,23 @@ classdef SeqPlot < handle
     %   lines. Accepts a numeric or a boolean parameter, defaults to
     %   false.
     %
+    %   plot(...,'extra',extra) Plot additional, caller-supplied waveforms
+    %   that are not derived from the seq object, each on its own new axis
+    %   appended after the built-in ones. extra is a struct array with
+    %   fields:
+    %     t        time vector, in seconds (same convention as the rest of
+    %              the plot -- not pre-scaled by 'timeDisp'). May instead be
+    %              a cell array of vectors to plot multiple traces sharing
+    %              one axis.
+    %     waveform data vector matching t (or a matching cell array).
+    %     label    y-axis label string for this axis (optional; defaults
+    %              to 'extra N').
+    %     name     cell array of legend entries, one per trace (optional;
+    %              only used when t/waveform are cell arrays).
+    %   Example:
+    %     extra(1).t = t1; extra(1).waveform = w1; extra(1).label = 'PNS prediction (a.u.)';
+    %     seq.plot('extra',extra)
+    %
     %   Press and drag the middle mouse button (or shift+left-click-drag)
     %   anywhere in the figure to pan (left/right motion) and zoom
     %   (up/down motion, drag up = zoom in) the visible time range; y-axis
@@ -60,6 +77,7 @@ classdef SeqPlot < handle
         axVisible       % logical vector, current visibility of each axis
         stackedMode     % logical, whether the stacked layout is active
         slewAxIdx       % indices into obj.ax of the SRx/SRy/SRz axes (7:9), [] when 'showSlew' is off
+        extraAxIdx      % indices into obj.ax of the user-supplied 'extra' axes, [] when none
         axColumns       % cell array of axis-index vectors, one per column of the (non-stacked) grid layout, top-to-bottom order within each
         axStackOrder    % axis indices in top-to-bottom order for the stacked layout
         xLabelStr       % x-axis label string, e.g. 't (ms)'
@@ -147,9 +165,11 @@ classdef SeqPlot < handle
                 parser.addParamValue('showGuides',true);%,@(x)(isstr(x)));%@(x) any(validatestring(x,validLabel))
                 parser.addParamValue('showLimits',true,@(x)(isnumeric(x) || islogical(x)));
                 parser.addParamValue('showSlew',false,@(x)(isnumeric(x) || islogical(x)));
+                parser.addParamValue('extra',struct('t',{},'waveform',{},'label',{}));
             end
             parse(parser,varargin{:});
             opt = parser.Results;
+            nExtra = numel(opt.extra);
 
             obj.stackedMode = logical(opt.stacked);
 
@@ -173,16 +193,16 @@ classdef SeqPlot < handle
             % the subplot grid shape is irrelevant (relayout() below
             % repositions everything), it only provides the axes
             showSlew = logical(opt.showSlew);
-            nAx = 6 + 3*showSlew;
-            nCols = nAx/3;
+            nAxBase = 6 + 3*showSlew;
+            nCols = nAxBase/3;
             if ~mr.aux.isOctave()
-              obj.ax = gobjects(1,nAx);
+              obj.ax = gobjects(1,nAxBase);
             end
-            for i=1:nAx
+            for i=1:nAxBase
                 obj.ax(i)=subplot(3,nCols,i);
             end
-            % Re-order axes column-major (equals [1 3 5 2 4 6] for nAx==6)
-            obj.ax=obj.ax(reshape(reshape(1:nAx,nCols,3).',1,[]));
+            % Re-order axes column-major (equals [1 3 5 2 4 6] for nAxBase==6)
+            obj.ax=obj.ax(reshape(reshape(1:nAxBase,nCols,3).',1,[]));
             if showSlew
                 obj.slewAxIdx = 7:9;
                 % each SR axis sits directly below its gradient axis, so
@@ -193,6 +213,23 @@ classdef SeqPlot < handle
                 obj.slewAxIdx = [];
                 obj.axColumns = {[1 2 3], [4 5 6]};
                 obj.axStackOrder = 1:6;
+            end
+            % user-supplied 'extra' waveforms each get their own axis,
+            % appended after the base(+slew) axes and grouped into one more
+            % grid column / the tail of the stacked order. This must happen
+            % before hold/grid/linkaxes below so those (and the several
+            % generic numel(obj.ax) loops further down) cover the extra
+            % axes too; the axes' initial subplot position is irrelevant
+            % since relayout() repositions everything explicitly.
+            if nExtra > 0
+                for i = 1:nExtra
+                    obj.ax(nAxBase+i) = axes('Parent', obj.f);
+                end
+                obj.extraAxIdx = nAxBase+1 : nAxBase+nExtra;
+                obj.axColumns{end+1} = obj.extraAxIdx;
+                obj.axStackOrder = [obj.axStackOrder, obj.extraAxIdx];
+            else
+                obj.extraAxIdx = [];
             end
             arrayfun(@(x)hold(x,'on'),obj.ax);
             arrayfun(@(x)grid(x,'on'),obj.ax);
@@ -213,6 +250,13 @@ classdef SeqPlot < handle
             obj.labels={'ADC/lbl/trig','RF mag (Hz)','RF/ADC ph (rad)','Gx (kHz/m)','Gy (kHz/m)','Gz (kHz/m)'};
             if showSlew
                 obj.labels=[obj.labels {'SRx (kHz/m/ms)','SRy (kHz/m/ms)','SRz (kHz/m/ms)'}];
+            end
+            for i = 1:nExtra
+                if isfield(opt.extra,'label') && ~isempty(opt.extra(i).label)
+                    obj.labels{end+1} = opt.extra(i).label;
+                else
+                    obj.labels{end+1} = sprintf('extra %d', i);
+                end
             end
             arrayfun(@(x)ylabel(obj.ax(x),obj.labels{x}),1:numel(obj.labels));
             if ~mr.aux.isOctave()
@@ -462,6 +506,25 @@ classdef SeqPlot < handle
                 t0=t0+seq.blockDurations(iB);%mr.calcDuration(block);
             end
 
+            % plot the user-supplied 'extra' waveforms, one axis per
+            % struct-array element; t/waveform may each be a plain vector
+            % (single trace) or a cell array of vectors (multiple traces
+            % sharing that axis), with an optional 'name' cell array of
+            % legend entries. t is expected in raw seconds, like every
+            % other time value plotted above, hence the same tFactor scale.
+            for i = 1:nExtra
+                ax = obj.ax(obj.extraAxIdx(i));
+                tCell = opt.extra(i).t;        if ~iscell(tCell), tCell = {tCell}; end
+                wCell = opt.extra(i).waveform; if ~iscell(wCell), wCell = {wCell}; end
+                hLines = gobjects(1, numel(tCell));
+                for k = 1:numel(tCell)
+                    hLines(k) = plot(tFactor*tCell{k}, wCell{k}, 'Parent', ax);
+                end
+                if isfield(opt.extra,'name') && ~isempty(opt.extra(i).name)
+                    legend(ax, hLines, opt.extra(i).name, 'AutoUpdate','off');
+                end
+            end
+
             % Cache, per axis, the x (time) value of every vertex of
             % every plotted line, so findHoverPoint can snap the guides/
             % data-tip to actual waveform time points instead of an
@@ -624,6 +687,28 @@ classdef SeqPlot < handle
             set(obj.f, 'ResizeFcn', @obj.relayout)
             obj.createControlPanel();
             obj.relayout();
+
+            % Axes created via axes() (the 'extra' axes) do not pick up the
+            % same automatic tick-label font size as axes created via
+            % subplot() -- MATLAB's 'auto' FontSizeMode evidently resolves
+            % differently depending on how the axes was created, not just
+            % its final size, so the extra axes' ticks otherwise render
+            % visibly smaller than the built-in ones. Force them (both the
+            % axes-level font used for labels/title and the tick-label
+            % fonts) to match a base axis explicitly. drawnow first so the
+            % reference axis' own 'auto' value has actually been resolved
+            % (auto-computed axis properties are otherwise only settled at
+            % render time -- see the drawnow before the ylim padding
+            % further above).
+            if ~isempty(obj.extraAxIdx) && ~mr.aux.isOctave()
+                drawnow;
+                refAx = obj.ax(1);
+                for idx = obj.extraAxIdx
+                    set(obj.ax(idx), 'FontSize', refAx.FontSize);
+                    obj.ax(idx).XAxis.FontSize = refAx.XAxis.FontSize;
+                    obj.ax(idx).YAxis.FontSize = refAx.YAxis.FontSize;
+                end
+            end
 
             if ~opt.hide
                 set(obj.f, 'Visible', 'on')
@@ -1046,6 +1131,15 @@ classdef SeqPlot < handle
             %   compatibility should that ever change) and
             %   updateDataTipFromCursor (this class's own manual
             %   hover-tip renderer, driven from onMmbDrag).
+
+            % user-supplied 'extra' axes have no corresponding seq block
+            % data to look up; show just the time/Y value
+            axIdx = find(obj.ax == ax, 1);
+            if ~isempty(obj.extraAxIdx) && ismember(axIdx, obj.extraAxIdx)
+                out = {['\bf\color{blue}t:\rm\color{black}' sprintf(obj.timeFormatStr,t)],...
+                       ['\bf\color{blue}Y:\rm\color{black}' num2str(yValue)]};
+                return;
+            end
 
             % get the relevant target from the y-axes title
             at=lower(ax.YLabel.String);
