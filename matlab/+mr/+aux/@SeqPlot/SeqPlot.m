@@ -32,11 +32,16 @@ classdef SeqPlot < handle
     %   defaults to true; set to 0 to hide the limit lines.
     %
     %   plot(...,'showSlew',1) Additionally plot the slew rate of each
-    %   gradient channel (in kHz/m/ms) as a stairstep plot on its own
-    %   axis directly below the corresponding gradient axis. With
-    %   'showLimits' enabled, maxSlew is shown as dashed red reference
-    %   lines. Accepts a numeric or a boolean parameter, defaults to
-    %   false.
+    %   gradient channel as a stairstep plot on its own axis directly
+    %   below the corresponding gradient axis. With 'showLimits' enabled,
+    %   maxSlew is shown as dashed red reference lines. Accepts a numeric
+    %   or a boolean parameter, defaults to false.
+    %
+    %   plot(...,'gradUnit',unit) Set the gradient / slew-rate display
+    %   units: 'mT/m' (default) shows mT/m and T/m/s, converted with
+    %   seq.sys.gamma; 'kHz/m' shows the nucleus-independent kHz/m and
+    %   kHz/m/ms. Can also be switched at runtime via the dropdown menu
+    %   in the top control row.
     %
     %   plot(...,'extra',extra) Plot additional, caller-supplied waveforms
     %   that are not derived from the seq object, each on its own new axis
@@ -90,6 +95,11 @@ classdef SeqPlot < handle
         zoomButton      % togglebutton uicontrol for zoom
         panButton       % togglebutton uicontrol for pan
         linkGradButton  % togglebutton uicontrol for gradient y-axis linking
+        gradUnitPopup    % popupmenu uicontrol selecting the gradient display units
+
+        gradUnit        % current entry of gradUnitList, sets the gradient/slew display units
+        gamma           % gyromagnetic ratio (Hz/T) used for the mT/m display, from seq.sys.gamma
+        gradScale       % factor from kHz/m (kHz/m/ms) to the currently displayed gradient (slew) unit
 
         gradYLinked     % logical, whether Gx/Gy/Gz share one y-scale
         gradYListeners  % cell array of YLim PostSet listeners for Gx/Gy/Gz
@@ -132,6 +142,11 @@ classdef SeqPlot < handle
         % indices into obj.ax of the Gx/Gy/Gz gradient axes
         gradAxIdx = [4 5 6];
 
+        % choices for the gradient display units ('gradUnit' option and
+        % dropdown menu); 'mT/m' -> mT/m and T/m/s, 'kHz/m' -> kHz/m and
+        % kHz/m/ms
+        gradUnitList = {'mT/m', 'kHz/m'};
+
         % gain for middle-button-drag vertical zoom: a full-axis-height
         % drag changes the time range width by a factor of 2^mmbZoomGain
         mmbZoomGain = 4;
@@ -150,6 +165,7 @@ classdef SeqPlot < handle
 
             validTimeUnits = {'s','ms','us'};
             validLabel = mr.getSupportedLabels();
+            validGradUnits = obj.gradUnitList;
             persistent parser
             if isempty(parser)
                 parser = inputParser;
@@ -166,10 +182,20 @@ classdef SeqPlot < handle
                 parser.addParamValue('showLimits',true,@(x)(isnumeric(x) || islogical(x)));
                 parser.addParamValue('showSlew',false,@(x)(isnumeric(x) || islogical(x)));
                 parser.addParamValue('extra',struct('t',{},'waveform',{},'label',{}));
+                parser.addParamValue('gradUnit',validGradUnits{1},...
+                    @(x) any(validatestring(x,validGradUnits)));
             end
             parse(parser,varargin{:});
             opt = parser.Results;
             nExtra = numel(opt.extra);
+
+            % gradients are plotted directly in the selected display unit;
+            % the dropdown menu rescales the plotted data later on
+            obj.gamma = seq.sys.gamma;
+            obj.gradUnit = validatestring(opt.gradUnit, validGradUnits);
+            obj.gradScale = obj.gradScaleFor(obj.gradUnit);
+            gScale = obj.gradScale;
+            [gUnit, srUnit] = obj.gradUnitStrings(obj.gradUnit);
 
             obj.stackedMode = logical(opt.stacked);
 
@@ -247,9 +273,10 @@ classdef SeqPlot < handle
             % below.
             linkaxes(obj.ax(:),'x')
             set(obj.ax, 'YLimMode', 'auto');
-            obj.labels={'ADC/lbl/trig','RF mag (Hz)','RF/ADC ph (rad)','Gx (kHz/m)','Gy (kHz/m)','Gz (kHz/m)'};
+            obj.labels=[{'ADC/lbl/trig','RF mag (Hz)','RF/ADC ph (rad)'}, ...
+                strcat({'Gx','Gy','Gz'}, [' (' gUnit ')'])];
             if showSlew
-                obj.labels=[obj.labels {'SRx (kHz/m/ms)','SRy (kHz/m/ms)','SRz (kHz/m/ms)'}];
+                obj.labels=[obj.labels strcat({'SRx','SRy','SRz'}, [' (' srUnit ')'])];
             end
             for i = 1:nExtra
                 if isfield(opt.extra,'label') && ~isempty(opt.extra(i).label)
@@ -475,10 +502,10 @@ classdef SeqPlot < handle
                                 % making the display a bit less confusing...
                                 %t=grad.delay + [0; grad.t + (grad.t(2)-grad.t(1))/2; grad.t(end) + grad.t(2)-grad.t(1)];
                                 t= grad.delay+[0; grad.tt; grad.shape_dur];
-                                waveform=1e-3* [grad.first; grad.waveform; grad.last];
+                                waveform=gScale*1e-3* [grad.first; grad.waveform; grad.last];
                             else
                                 t=cumsum([0 grad.delay grad.riseTime grad.flatTime grad.fallTime]);
-                                waveform=1e-3*grad.amplitude*[0 0 1 1 0];
+                                waveform=gScale*1e-3*grad.amplitude*[0 0 1 1 0];
                             end
                             plot(tFactor*(t0+t),waveform,'Parent',obj.ax(3+j));
                             if showSlew && numel(t) > 1
@@ -488,8 +515,9 @@ classdef SeqPlot < handle
                                 % zero-duration segments (e.g. trapezoids
                                 % with delay==0 or flatTime==0) are
                                 % dropped to avoid 0/0. waveform is in
-                                % kHz/m and t in s, so the extra 1e-3
-                                % yields kHz/m/ms. The last value is
+                                % kHz/m (mT/m) and t in s, so the extra
+                                % 1e-3 yields kHz/m/ms (mT/m/ms = T/m/s),
+                                % i.e. gScale applies to both. The last value is
                                 % repeated so the final step spans to the
                                 % end of the event.
                                 tv=t(:); dt=diff(tv); dw=diff(waveform(:));
@@ -619,7 +647,7 @@ classdef SeqPlot < handle
                 else
                     limLineWidth = 2*get(groot,'DefaultLineLineWidth'); % twice the usual waveform line width
                     maxB1Plot   = seq.sys.maxB1;        % Hz, matches the RF mag axis
-                    maxGradPlot = 1e-3*seq.sys.maxGrad; % Hz/m -> kHz/m, matches the gradient axes
+                    maxGradPlot = gScale*1e-3*seq.sys.maxGrad; % Hz/m -> kHz/m (-> display unit), matches the gradient axes
                     % RF magnitude limit (axis 2)
                     yline(obj.ax(2),  maxB1Plot, '--', 'Color',[1 0 0], 'Alpha',0.5, 'LineWidth',limLineWidth);
                     yline(obj.ax(2), -maxB1Plot, '--', 'Color',[1 0 0], 'Alpha',0.5, 'LineWidth',limLineWidth);
@@ -630,7 +658,7 @@ classdef SeqPlot < handle
                     end
                     % slew-rate limits (axes 7,8,9 = SRx,SRy,SRz), if present
                     if ~isempty(obj.slewAxIdx)
-                        maxSlewPlot = 1e-6*seq.sys.maxSlew; % Hz/m/s -> kHz/m/ms, matches the slew axes
+                        maxSlewPlot = gScale*1e-6*seq.sys.maxSlew; % Hz/m/s -> kHz/m/ms (-> display unit), matches the slew axes
                         for idx=obj.slewAxIdx
                             yline(obj.ax(idx),  maxSlewPlot, '--', 'Color',[1 0 0], 'Alpha',0.5, 'LineWidth',limLineWidth);
                             yline(obj.ax(idx), -maxSlewPlot, '--', 'Color',[1 0 0], 'Alpha',0.5, 'LineWidth',limLineWidth);
@@ -803,6 +831,19 @@ classdef SeqPlot < handle
             [obj.panButton, x]  = obj.addButton('Pan',  x, y, h, gap, @(src,~) obj.onTogglePan(src));
             [~, x] = obj.addButton(char(8962), x, y, h, gap, @(src,~) obj.onResetView(src), 'pushbutton');
 
+            % gradient display units; entries match gradUnitList, the
+            % mT/m entry shows the sys.gamma used for the conversion.
+            % Placed early in the row so it stays visible in narrow
+            % figures, where the trailing buttons get clipped.
+            x = x + 3*gap;
+            popupW = 150;
+            items = {sprintf('mT/m (%s = %.4g MHz/T)', char(947), obj.gamma*1e-6), 'kHz/m'};
+            obj.gradUnitPopup = uicontrol('Parent', obj.controlPanel, 'Style', 'popupmenu', ...
+                'String', items, 'Value', find(strcmp(obj.gradUnitList, obj.gradUnit)), ...
+                'Units', 'pixels', 'Position', [x y popupW h], ...
+                'Callback', @(src,~) obj.onGradUnitChanged(src));
+            x = x + popupW + gap;
+
             x = x + 3*gap;
             obj.waveformButtons = gobjects(1, numel(obj.labels));
             for i = 1:numel(obj.labels)
@@ -812,9 +853,81 @@ classdef SeqPlot < handle
             end
 
             x = x + 3*gap;
-            [obj.linkGradButton, x] = obj.addButton('Link Grad Y', x, y, h, gap, ...
+            obj.linkGradButton = obj.addButton('Link Grad Y', x, y, h, gap, ...
                 @(src,~) obj.onToggleGradYLink(src));
             set(obj.linkGradButton, 'Value', obj.gradYLinked);
+        end
+
+        function onGradUnitChanged(obj, src)
+            % onGradUnitChanged(src)
+            %   Callback for the gradient-unit dropdown menu.
+
+            obj.setGradUnit(obj.gradUnitList{src.Value});
+        end
+
+        function setGradUnit(obj, unit)
+            % setGradUnit(unit)
+            %   Switches the Gx/Gy/Gz (and SRx/SRy/SRz) display units by
+            %   rescaling the already plotted data, the limit reference
+            %   lines, the current and initial y-limits and the y-axis
+            %   labels in place, so the zoom state is kept and the hover
+            %   data tip (which reads YData) follows automatically.
+
+            newScale = obj.gradScaleFor(unit);
+            ratio = newScale / obj.gradScale;
+            obj.gradUnit = unit;
+            obj.gradScale = newScale;
+            if ratio == 1
+                return;
+            end
+            [gUnit, srUnit] = obj.gradUnitStrings(unit);
+            obj.syncingGradYLim = true;
+            for idx = [obj.gradAxIdx obj.slewAxIdx]
+                hAx = obj.ax(idx);
+                hL = findobj(hAx, 'Type', 'line', '-or', 'Type', 'stair');
+                if ~isempty(hL)
+                    yd = get(hL, {'YData'});
+                    set(hL, {'YData'}, cellfun(@(y) ratio*y, yd, 'UniformOutput', false));
+                end
+                % limit lines are y-ConstantLines; the x-ConstantLines
+                % are the cursor guides and must stay untouched
+                for hC = findobj(hAx, 'Type', 'constantline')'
+                    if strcmp(hC.InterceptAxis, 'y')
+                        hC.Value = ratio*hC.Value;
+                    end
+                end
+                ylim(hAx, ratio*ylim(hAx));
+                obj.initialYLim(idx,:) = ratio*obj.initialYLim(idx,:);
+                if ismember(idx, obj.slewAxIdx), lblUnit = srUnit; else, lblUnit = gUnit; end
+                obj.labels{idx} = sprintf('%s (%s)', obj.stripBrackets(obj.labels{idx}), lblUnit);
+                ylabel(hAx, obj.labels{idx});
+            end
+            obj.syncingGradYLim = false;
+        end
+
+        function s = gradScaleFor(obj, unit)
+            % gradScaleFor(unit)
+            %   Factor converting kHz/m to the gradient display unit; the
+            %   same factor converts kHz/m/ms to the slew unit.
+
+            switch unit
+                case 'mT/m'
+                    s = 1e6/obj.gamma; % kHz/m -> mT/m, kHz/m/ms -> T/m/s
+                otherwise
+                    s = 1;
+            end
+        end
+
+        function [gUnit, srUnit] = gradUnitStrings(~, unit)
+            % gradUnitStrings(unit)
+            %   Gradient and slew-rate unit strings for the display unit.
+
+            switch unit
+                case 'mT/m'
+                    gUnit = 'mT/m';  srUnit = 'T/m/s';
+                otherwise
+                    gUnit = 'kHz/m'; srUnit = 'kHz/m/ms';
+            end
         end
 
         function str = stripBrackets(~, str)
