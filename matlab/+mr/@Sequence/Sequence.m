@@ -2735,12 +2735,12 @@ classdef Sequence < handle
 
         function ok=copyToRemote(seq, servername, username, localFile, remoteFolder)
             %copyToRemote Copy the sequence to a folder on a remote host.
-            %   copyToRemote(seq,servername,remoteFolder,username) writes the
-            %   sequence to a temporary .seq file and copies it into
-            %   remoteFolder on servername via ssh/scp, logging in as
-            %   username. The remote directory is created first if it does
-            %   not exist, and the file is named after the sequence's 'Name'
-            %   definition (falling back to 'external').
+            %   copyToRemote(seq,servername,username,localFile,remoteFolder)
+            %   copies localFile (writing the sequence to it first if it
+            %   does not exist) into remoteFolder on servername via ssh/scp,
+            %   logging in as username. The remote directory is created
+            %   first if it does not exist, and the remote file keeps the
+            %   name of localFile.
             %
             %   Requires an OpenSSH client (ssh/scp) on the system PATH and
             %   either an ssh-agent/key or an interactive password prompt.
@@ -2748,12 +2748,9 @@ classdef Sequence < handle
             %
             %   See also install
 
-            % name the remote file after the sequence, as install() does
-            seqName = seq.getDefinition('Name');
-            if isempty(seqName)
-                seqName = 'external';
-            end
-            remoteFile = [remoteFolder '/' seqName '.seq'];
+            % keep the local file name on the remote side
+            [~, fileName, fileExt] = fileparts(localFile);
+            remoteFile            = [remoteFolder '/' fileName fileExt];
 
             if ~isfile(localFile)
                 seq.write(localFile);
