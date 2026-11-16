@@ -2765,16 +2765,26 @@ classdef Sequence < handle
             % through by hand in the debugger). Same pattern as install().
             sshOpts = '-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new';
 
+            % system() hands MATLAB's console stdin to the child process,
+            % and ssh/scp then sit waiting on it until the user presses
+            % Enter. Redirect stdin from the null device (and pass -n to
+            % ssh) so the calls never block on keyboard input.
+            if ispc
+                noStdin = '< NUL';
+            else
+                noStdin = '< /dev/null';
+            end
+
             % create the remote directory first (ssh+scp pattern following
             % the writeBSSFP_radial copySeqToRemote helper)
-            sshCmd = sprintf('ssh %s %s@%s "mkdir -p ''%s''"', sshOpts, username, servername, remoteFolder);
+            sshCmd = sprintf('ssh -n %s %s@%s "mkdir -p ''%s''" %s', sshOpts, username, servername, remoteFolder, noStdin);
             [mkdirStatus, mkdirOut] = system(sshCmd);
             if mkdirStatus ~= 0
                 warning('Could not create remote folder %s on %s:\n%s', remoteFolder, servername, mkdirOut);
             end
 
             fprintf('Copying sequence to %s@%s:%s\n', username, servername, remoteFile);
-            scpCmd = sprintf('scp %s "%s" %s@%s:"%s"', sshOpts, localFile, username, servername, remoteFile);
+            scpCmd = sprintf('scp %s "%s" %s@%s:"%s" %s', sshOpts, localFile, username, servername, remoteFile, noStdin);
             [status, cmdout] = system(scpCmd);
             ok = status == 0;
             if ok
